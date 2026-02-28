@@ -1,0 +1,515 @@
+import json
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+import textwrap
+from typing import Any, Dict, List, Optional
+
+from fpdf import FPDF
+
+from src.agents.expert_security_agent import ExpertSecurityAgent
+from src.agents.policy_agent import PolicyAgent
+from src.mcp.mcp_client import MCPClient
+
+
+class SecurityReviewWorkflow:
+    def __init__(
+        self,
+        agents: Optional[List[Any]] = None,
+        mcp_client: Optional[MCPClient] = None,
+        expert_agent: Optional[ExpertSecurityAgent] = None,
+        policy_agent: Optional[PolicyAgent] = None,
+        rules_path: str = "governance/policy.json",
+    ):
+        self.agents = agents or []
+        self.mcp_client = mcp_client or MCPClient(use_mock=True)
+        self.expert_agent = expert_agent or ExpertSecurityAgent(use_llm=False)
+        self.policy_agent = policy_agent or PolicyAgent(use_llm=False)
+        self.rules_path = rules_path
+
+    def execute(self):
+        return True
+
+    def orchestrate(self, services: Optional[List[Dict[str, str]]] = None, hitl_approved: bool = False):
+        if services is None:
+            return True
+        return self.run_security_review(services=services, hitl_approved=hitl_approved)
+
+    def fetch_data(self, services: Optional[List[Dict[str, str]]] = None):
+        if services is None:
+            return {}
+
+        with ThreadPoolExecutor(max_workers=max(1, len(services))) as executor:
+            results = list(executor.map(self._fetch_service_data, services))
+
+        return {item["service_name"]: item for item in results}
+
+    def _fetch_service_data(self, service: Dict[str, str]) -> Dict[str, Any]:
+        service_name = service.get("service_name", "Unknown Service")
+        release_version = service.get("release_version", "main")
+        return self.mcp_client.fetch_full_reports(service_name, release_version)
+
+    def aggregate_results(self, results=None):
+        if results is None:
+            return []
+
+        if isinstance(results, dict) and all(
+            isinstance(value, dict) and "sonar" in value and "checkmarx" in value
+            for value in results.values()
+        ):
+            return [self._build_service_summary(value) for value in results.values()]
+
+        return [
+            {"agent": agent_name, "result": agent_result}
+            for agent_name, agent_result in results.items()
+        ]
+
+    def _build_service_summary(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        checkmarx = payload.get("checkmarx", {})
+        sast = checkmarx.get("sast", {})
+        sca = checkmarx.get("sca", {})
+
+        return {
+            "service_name": payload.get("service_name", "Unknown Service"),
+            "release_version": payload.get("release_version", "main"),
+            "sonar_status": payload.get("sonar", {}).get("status", "UNKNOWN"),
+            "checkmarx_sast": {
+                "critical": int(sast.get("critical", 0)),
+                "high": int(sast.get("high", 0)),
+            },
+            "checkmarx_sca": {
+                "critical": int(sca.get("critical", 0)),
+                "high": int(sca.get("high", 0)),
+            },
+        }
+
+    def run_security_review(self, services: List[Dict[str, str]], hitl_approved: bool = False) -> Dict[str, Any]:
+        raw_results = self.fetch_data(services)
+        summary_rows = self.aggregate_results(raw_results)
+
+        deep_dive = {}
+        for service_name, payload in raw_results.items():
+            deep_dive[service_name] = {
+                "raw": payload,
+                "analysis": self.expert_agent.analyze_service_findings(payload),
+            }
+
+        decision = self._evaluate_governance(summary_rows, deep_dive)
+        critical_count = decision["counts"]["critical"]
+        requires_hitl = bool(decision.get("requires_approval", False)) or critical_count > 0
+        paused_for_hitl = requires_hitl and not hitl_approved
+
+        final_status = "NO-GO" if paused_for_hitl else decision["status"]
+        pdf_path = None
+        if not paused_for_hitl:
+            pdf_path = self.generate_attestation_pdf(
+                summary_rows=summary_rows,
+                deep_dive=deep_dive,
+                status=final_status,
+                governance_reason=decision["reason"],
+                governance_decision=decision,
+            )
+
+        return {
+            "summary": summary_rows,
+            "deep_dive": deep_dive,
+            "governance": decision,
+            "requires_hitl": requires_hitl,
+            "paused_for_hitl": paused_for_hitl,
+            "status": final_status,
+            "attestation_pdf": pdf_path,
+        }
+
+    def _evaluate_governance(self, summary_rows: List[Dict[str, Any]], deep_dive: Dict[str, Any]) -> Dict[str, Any]:
+        rules = self._load_rules()
+        result = self.policy_agent.evaluate_release(summary_rows, rules, deep_dive)
+        result.setdefault("status", "NO-GO")
+        result.setdefault("reason", "Governance evaluation completed.")
+        result.setdefault("counts", {"critical": 0, "high": 0})
+        result.setdefault("requires_approval", False)
+        return result
+
+    def _load_rules(self) -> Dict[str, Any]:
+        rules_file = Path(self.rules_path)
+        if not rules_file.exists():
+            return {
+                "policy_metadata": {
+                    "version": "2026.1",
+                    "org_standard": "ISO-27001-Agentic-Baseline",
+                    "enforcement_mode": "Strict",
+                },
+                "quality_gates": {
+                    "sonarqube": {
+                        "min_quality_gate_status": "PASSED",
+                        "max_technical_debt_hours": 8,
+                        "block_on_new_critical_issues": True,
+                        "min_code_coverage_percent": 80,
+                    },
+                    "checkmarx_sast": {
+                        "block_on": ["CRITICAL", "HIGH"],
+                        "allow_amber_on": ["MEDIUM"],
+                        "false_positive_triage_required": True,
+                    },
+                    "checkmarx_sca": {
+                        "block_on_malicious_packages": True,
+                        "max_cvss_score_allowed": 8.9,
+                        "allow_exceptions_for_dev_dependencies": True,
+                    },
+                },
+                "agentic_rules": {
+                    "correlation_threshold": "HIGH",
+                    "auto_fix_eligibility": ["Sonar_Minor", "SCA_Outdated_Library"],
+                    "human_in_the_loop": {
+                        "trigger_on": ["AMBER_STATUS", "POLICY_EXCEPTION_REQUEST"],
+                        "required_role": "Security_Lead",
+                        "timeout_hours": 24,
+                    },
+                },
+            }
+
+        with rules_file.open("r", encoding="utf-8") as file:
+            return json.load(file)
+
+    def generate_attestation_pdf(
+        self,
+        summary_rows: List[Dict[str, Any]],
+        deep_dive: Dict[str, Any],
+        status: str,
+        governance_reason: str,
+        governance_decision: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        output_dir = Path("reports")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"release_attestation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        content_width = pdf.w - pdf.l_margin - pdf.r_margin
+        generated_at = datetime.now().isoformat(timespec="seconds")
+        governance_decision = governance_decision or {}
+        decision_record = governance_decision.get("decision_record", {})
+
+        total_critical = sum(
+            row["checkmarx_sast"]["critical"] + row["checkmarx_sca"]["critical"] for row in summary_rows
+        )
+        total_high = sum(
+            row["checkmarx_sast"]["high"] + row["checkmarx_sca"]["high"] for row in summary_rows
+        )
+
+        def write_block(text: str, line_height: int = 7):
+            pdf.set_x(pdf.l_margin)
+            pdf.multi_cell(
+                content_width,
+                line_height,
+                self._safe_pdf_text(text),
+                new_x="LMARGIN",
+                new_y="NEXT",
+            )
+
+        pdf.set_fill_color(16, 56, 112)
+        pdf.rect(0, 0, pdf.w, 34, style="F")
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_xy(pdf.l_margin, 10)
+        pdf.set_font("Helvetica", "B", 20)
+        pdf.cell(content_width, 10, "Release Attestation", ln=True)
+        pdf.set_font("Helvetica", size=10)
+        pdf.set_x(pdf.l_margin)
+        pdf.cell(content_width, 6, f"Generated: {generated_at}", ln=True)
+
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_y(40)
+
+        status_r, status_g, status_b = self._status_color(status)
+        pdf.set_fill_color(status_r, status_g, status_b)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.set_x(pdf.l_margin)
+        pdf.cell(52, 10, f"Executive Status: {status}", border=0, ln=True, fill=True)
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(2)
+
+        pdf.set_font("Helvetica", size=11)
+        write_block(f"Governance Decision: {governance_reason}", line_height=8)
+        pdf.ln(1)
+
+        final_decision = decision_record.get("final_decision", "N/A")
+        policy_violations = decision_record.get("policy_violations", [])
+        approver_role = decision_record.get("approver_role_required", "N/A")
+        requires_approval = decision_record.get("requires_approval", False)
+
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_x(pdf.l_margin)
+        pdf.cell(content_width, 7, "Policy Decision", ln=True)
+        pdf.set_fill_color(242, 247, 255)
+        pdf.set_draw_color(180, 200, 225)
+        box_y = pdf.get_y()
+        box_h = 24
+        pdf.rect(pdf.l_margin, box_y, content_width, box_h, style="DF")
+        pdf.set_xy(pdf.l_margin + 2, box_y + 2)
+        pdf.set_font("Helvetica", size=10)
+        pdf.cell(content_width - 4, 5, f"Final Decision: {final_decision}", ln=True)
+        pdf.set_x(pdf.l_margin + 2)
+        pdf.cell(content_width - 4, 5, f"Requires Approval: {requires_approval} | Approver Role: {approver_role}", ln=True)
+        violations_text = ", ".join(policy_violations) if policy_violations else "none"
+        pdf.set_x(pdf.l_margin + 2)
+        pdf.cell(content_width - 4, 5, f"Policy Violations: {violations_text[:140]}", ln=True)
+        pdf.set_y(box_y + box_h + 2)
+
+        justification_request = decision_record.get("justification_request")
+        if justification_request:
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.set_x(pdf.l_margin)
+            pdf.cell(content_width, 6, "HITL Justification Request", ln=True)
+            pdf.set_font("Helvetica", size=10)
+            write_block(justification_request, line_height=6)
+
+        pdf.ln(1)
+
+        card_w = (content_width - 8) / 3
+        card_y = pdf.get_y()
+        cards = [
+            ("Services", str(len(summary_rows)), (32, 100, 170)),
+            ("Critical", str(total_critical), (184, 28, 53)),
+            ("High", str(total_high), (237, 137, 54)),
+        ]
+        for index, (label, value, color) in enumerate(cards):
+            x = pdf.l_margin + index * (card_w + 4)
+            pdf.set_fill_color(*color)
+            pdf.rect(x, card_y, card_w, 20, style="F")
+            pdf.set_text_color(255, 255, 255)
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.set_xy(x + 2, card_y + 3)
+            pdf.cell(card_w - 4, 6, label)
+            pdf.set_font("Helvetica", "B", 15)
+            pdf.set_xy(x + 2, card_y + 10)
+            pdf.cell(card_w - 4, 7, value)
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_y(card_y + 24)
+
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.set_x(pdf.l_margin)
+        pdf.cell(content_width, 8, "Summary", ln=True)
+        self._draw_summary_table(pdf, summary_rows, content_width)
+        pdf.ln(3)
+
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.set_x(pdf.l_margin)
+        pdf.cell(content_width, 8, "Vulnerability Distribution", ln=True)
+        self._draw_summary_chart(pdf, summary_rows, content_width)
+
+        for service_name, details in deep_dive.items():
+            pdf.add_page()
+            pdf.set_fill_color(240, 247, 255)
+            pdf.rect(0, 0, pdf.w, 18, style="F")
+            pdf.set_font("Helvetica", "B", 13)
+            pdf.set_x(pdf.l_margin)
+            pdf.set_y(7)
+            pdf.cell(content_width, 8, f"Deep Dive - {service_name}", ln=True)
+            pdf.set_font("Helvetica", size=10)
+            pdf.set_y(22)
+            analyses = details.get("analysis", [])
+            if not analyses:
+                pdf.set_x(pdf.l_margin)
+                pdf.cell(content_width, 7, "No findings.", ln=True)
+                continue
+
+            for item in analyses:
+                if pdf.get_y() > pdf.h - 55:
+                    pdf.add_page()
+                    pdf.set_y(20)
+
+                label = "False Positive" if item.get("false_positive") else "Valid Finding"
+                severity = item.get("severity", "UNKNOWN")
+                sev_r, sev_g, sev_b = self._severity_color(severity, item.get("false_positive", False))
+
+                pdf.set_fill_color(sev_r, sev_g, sev_b)
+                pdf.set_text_color(255, 255, 255)
+                pdf.set_font("Helvetica", "B", 10)
+                pdf.set_x(pdf.l_margin)
+                pdf.cell(
+                    content_width,
+                    8,
+                    f"{severity} | {item.get('finding_id', 'N/A')} | {label}",
+                    border=0,
+                    ln=True,
+                    fill=True,
+                )
+
+                pdf.set_text_color(0, 0, 0)
+                pdf.set_font("Helvetica", size=10)
+                write_block(f"Category: {item.get('category', 'N/A')}")
+                write_block(f"Reason: {item.get('reason', '')}")
+                write_block(f"Real-World Risk: {item.get('real_world_risk', '')}")
+                write_block("Proposed Fix:")
+
+                pdf.set_fill_color(248, 250, 252)
+                pdf.set_x(pdf.l_margin)
+                pdf.multi_cell(
+                    content_width,
+                    6,
+                    self._safe_pdf_text(item.get("proposed_fix_snippet", ""), width=100),
+                    border=1,
+                    fill=True,
+                    new_x="LMARGIN",
+                    new_y="NEXT",
+                )
+                pdf.ln(3)
+
+        pdf.output(str(output_path))
+        return str(output_path)
+
+    def _draw_summary_table(self, pdf: FPDF, summary_rows: List[Dict[str, Any]], content_width: float) -> None:
+        columns = [
+            ("Service", 42),
+            ("Version", 30),
+            ("Sonar", 22),
+            ("SAST C", 15),
+            ("SAST H", 15),
+            ("SCA C", 15),
+            ("SCA H", 15),
+            ("Total", 16),
+        ]
+
+        scale = content_width / sum(width for _, width in columns)
+        scaled_columns = [(name, width * scale) for name, width in columns]
+
+        pdf.set_fill_color(31, 78, 121)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_x(pdf.l_margin)
+        for label, width in scaled_columns:
+            pdf.cell(width, 8, label, border=1, align="C", fill=True)
+        pdf.ln(8)
+
+        pdf.set_font("Helvetica", size=9)
+        for row_index, row in enumerate(summary_rows):
+            fill = (246, 249, 252) if row_index % 2 == 0 else (255, 255, 255)
+            pdf.set_fill_color(*fill)
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_x(pdf.l_margin)
+
+            values = [
+                row["service_name"][:20],
+                row["release_version"][:16],
+                row["sonar_status"],
+                str(row["checkmarx_sast"]["critical"]),
+                str(row["checkmarx_sast"]["high"]),
+                str(row["checkmarx_sca"]["critical"]),
+                str(row["checkmarx_sca"]["high"]),
+                str(
+                    row["checkmarx_sast"]["critical"]
+                    + row["checkmarx_sast"]["high"]
+                    + row["checkmarx_sca"]["critical"]
+                    + row["checkmarx_sca"]["high"]
+                ),
+            ]
+
+            for col_index, (value, (_, width)) in enumerate(zip(values, scaled_columns)):
+                align = "L" if col_index < 2 else "C"
+                if col_index >= 3 and value.isdigit() and int(value) > 0:
+                    if col_index in (3, 5):
+                        pdf.set_text_color(184, 28, 53)
+                    else:
+                        pdf.set_text_color(180, 83, 9)
+                else:
+                    pdf.set_text_color(0, 0, 0)
+                pdf.cell(width, 8, value, border=1, align=align, fill=True)
+            pdf.ln(8)
+
+        pdf.set_text_color(0, 0, 0)
+
+    def _draw_summary_chart(self, pdf: FPDF, summary_rows: List[Dict[str, Any]], content_width: float) -> None:
+        if not summary_rows:
+            return
+
+        chart_x = pdf.l_margin
+        chart_y = pdf.get_y()
+        chart_w = content_width
+        chart_h = 52
+        baseline_y = chart_y + chart_h - 10
+
+        pdf.set_draw_color(205, 214, 224)
+        pdf.rect(chart_x, chart_y, chart_w, chart_h)
+        pdf.line(chart_x + 6, baseline_y, chart_x + chart_w - 6, baseline_y)
+
+        critical_values = [
+            row["checkmarx_sast"]["critical"] + row["checkmarx_sca"]["critical"]
+            for row in summary_rows
+        ]
+        high_values = [
+            row["checkmarx_sast"]["high"] + row["checkmarx_sca"]["high"]
+            for row in summary_rows
+        ]
+        max_value = max(1, *(critical_values + high_values))
+
+        group_w = (chart_w - 16) / len(summary_rows)
+        bar_w = max(4, group_w * 0.22)
+
+        for index, row in enumerate(summary_rows):
+            group_x = chart_x + 8 + index * group_w
+            critical = critical_values[index]
+            high = high_values[index]
+
+            critical_h = ((chart_h - 18) * critical) / max_value
+            high_h = ((chart_h - 18) * high) / max_value
+
+            pdf.set_fill_color(184, 28, 53)
+            pdf.rect(group_x + 3, baseline_y - critical_h, bar_w, critical_h, style="F")
+            pdf.set_fill_color(217, 119, 6)
+            pdf.rect(group_x + 3 + bar_w + 2, baseline_y - high_h, bar_w, high_h, style="F")
+
+            pdf.set_font("Helvetica", size=7)
+            pdf.set_text_color(70, 70, 70)
+            pdf.set_xy(group_x, baseline_y + 1)
+            pdf.cell(group_w - 2, 4, row["service_name"][:12], align="C")
+
+        legend_y = chart_y + 2
+        legend_x = chart_x + chart_w - 60
+        pdf.set_fill_color(184, 28, 53)
+        pdf.rect(legend_x, legend_y, 4, 4, style="F")
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font("Helvetica", size=8)
+        pdf.set_xy(legend_x + 6, legend_y - 1)
+        pdf.cell(20, 5, "Critical")
+
+        pdf.set_fill_color(217, 119, 6)
+        pdf.rect(legend_x + 30, legend_y, 4, 4, style="F")
+        pdf.set_xy(legend_x + 36, legend_y - 1)
+        pdf.cell(16, 5, "High")
+
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_y(chart_y + chart_h + 2)
+
+    def _status_color(self, status: str):
+        return (22, 163, 74) if status.upper() == "GO" else (184, 28, 53)
+
+    def _severity_color(self, severity: str, false_positive: bool):
+        if false_positive:
+            return (5, 150, 105)
+
+        sev = severity.upper()
+        if sev == "CRITICAL":
+            return (184, 28, 53)
+        if sev == "HIGH":
+            return (217, 119, 6)
+        if sev == "MEDIUM":
+            return (2, 132, 199)
+        return (71, 85, 105)
+
+    def _safe_pdf_text(self, value: str, width: int = 110) -> str:
+        text = str(value).replace("\t", "    ").replace("\r\n", "\n").replace("\r", "\n")
+        wrapped_lines = []
+        for line in text.split("\n"):
+            line = line if line.strip() else " "
+            wrapped = textwrap.fill(
+                line,
+                width=width,
+                break_long_words=True,
+                break_on_hyphens=True,
+            )
+            wrapped_lines.append(wrapped)
+        return "\n".join(wrapped_lines)
+
+    def manage_hitl(self, aggregated_results):
+        return None

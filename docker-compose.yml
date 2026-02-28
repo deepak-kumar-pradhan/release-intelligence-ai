@@ -1,0 +1,15 @@
+services:
+  release-intelligence-ri:
+    build: .
+    image: release-intelligence-ri:latest
+    container_name: release-intelligence-ri
+    ports:
+      - "8503:8503"
+    volumes:
+      - ./reports:/app/reports
+      - ./session:/app/session
+    environment:
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+      AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:-}
+    restart: unless-stopped

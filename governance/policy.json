@@ -1,0 +1,45 @@
+{
+  "policy_metadata": {
+    "version": "2026.1",
+    "org_standard": "ISO-27001-Agentic-Baseline",
+    "enforcement_mode": "Strict"
+  },
+  "quality_gates": {
+    "sonarqube": {
+      "min_quality_gate_status": "PASSED",
+      "max_technical_debt_hours": 8,
+      "block_on_new_critical_issues": true,
+      "min_code_coverage_percent": 80
+    },
+    "checkmarx_sast": {
+      "block_on": [
+        "CRITICAL",
+        "HIGH"
+      ],
+      "allow_amber_on": [
+        "MEDIUM"
+      ],
+      "false_positive_triage_required": true
+    },
+    "checkmarx_sca": {
+      "block_on_malicious_packages": true,
+      "max_cvss_score_allowed": 8.9,
+      "allow_exceptions_for_dev_dependencies": true
+    }
+  },
+  "agentic_rules": {
+    "correlation_threshold": "HIGH",
+    "auto_fix_eligibility": [
+      "Sonar_Minor",
+      "SCA_Outdated_Library"
+    ],
+    "human_in_the_loop": {
+      "trigger_on": [
+        "AMBER_STATUS",
+        "POLICY_EXCEPTION_REQUEST"
+      ],
+      "required_role": "Security_Lead",
+      "timeout_hours": 24
+    }
+  }
+}
