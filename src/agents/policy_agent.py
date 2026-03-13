@@ -2,9 +2,11 @@ import json
 import os
 from typing import Any, Dict, List, Optional
 
+from src.observability import get_tracer
+
 try:
     from openai import OpenAI
-except Exception:
+except ImportError:
     OpenAI = None
 
 
@@ -13,6 +15,8 @@ class PolicyAgent:
         self.use_llm = use_llm
         self.model = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
         self.max_response_tokens = self._coerce_int(os.getenv("POLICY_LLM_MAX_RESPONSE_TOKENS", "180"), default=180)
+        self.llm_only_amber = os.getenv("POLICY_LLM_ONLY_AMBER", "true").lower() == "true"
+        self.tracer = get_tracer("release_intelligence.policy_agent")
         self.client = self._build_client() if use_llm else None
         if not use_llm:
             print("[LLM][PolicyAgent] Disabled: missing AZURE_OPENAI_ENDPOINT/API_KEY")
@@ -24,7 +28,7 @@ class PolicyAgent:
 
         endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
         api_key = os.getenv("AZURE_OPENAI_API_KEY")
-        if not endpoint or not api_key:
+        if not endpoint or not api_key or self._is_placeholder_secret(api_key):
             print("[LLM][PolicyAgent] Missing endpoint or api_key")
             return None
 
@@ -37,60 +41,117 @@ class PolicyAgent:
             api_key=api_key,
         )
 
+    def _is_placeholder_secret(self, value: str) -> bool:
+        normalized = str(value or "").strip()
+        if not normalized:
+            return True
+        upper = normalized.upper()
+        return upper.startswith("REPLACE_WITH_") or "YOUR_" in upper
+
     def evaluate_release(
         self,
         summary_rows: List[Dict[str, Any]],
         rules: Dict[str, Any],
         triage_findings: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        if self.client:
+        with self.tracer.start_as_current_span("policy_agent.evaluate_release") as span:
+            deterministic = self._deterministic_evaluate(summary_rows, rules, triage_findings or {})
+            decision_record = deterministic.get("decision_record", {})
+            final_decision = str(decision_record.get("final_decision", "FAIL")).upper()
+            span.set_attribute("policy.final_decision", final_decision)
+            span.set_attribute("policy.llm_only_amber", self.llm_only_amber)
+
+            if not self.client:
+                span.add_event("policy.deterministic_only")
+                print("[LLM][PolicyAgent] Using deterministic policy path")
+                return deterministic
+
+            if self.llm_only_amber and final_decision != "AMBER":
+                span.add_event("policy.llm_skipped", {"reason": f"final_decision={final_decision}"})
+                print(f"[LLM][PolicyAgent] Skipping LLM for final_decision={final_decision} (cost optimization)")
+                return deterministic
+
             try:
-                print("[LLM][PolicyAgent] Evaluating governance with LLM")
-                return self._llm_evaluate(summary_rows, rules, triage_findings or {})
+                print("[LLM][PolicyAgent] Escalating governance evaluation to LLM")
+                llm_decision = self._llm_evaluate(summary_rows, rules, triage_findings or {})
+                if "reason" not in llm_decision:
+                    llm_decision["reason"] = deterministic.get("reason", "Policy evaluation completed.")
+                if "counts" not in llm_decision:
+                    llm_decision["counts"] = deterministic.get("counts", {"critical": 0, "high": 0})
+                span.add_event("policy.llm_used")
+                return llm_decision
             except Exception as error:
+                span.record_exception(error)
                 print(f"[LLM][PolicyAgent] LLM evaluation failed, using deterministic path: {error}")
-                return self._deterministic_evaluate(summary_rows, rules, triage_findings or {})
-        print("[LLM][PolicyAgent] Using deterministic policy path")
-        return self._deterministic_evaluate(summary_rows, rules, triage_findings or {})
+                return deterministic
 
     def _llm_evaluate(self, summary_rows: List[Dict[str, Any]], rules: Dict[str, Any], triage_findings: Dict[str, Any]) -> Dict[str, Any]:
-        payload = {
-            "summary_rows": self._compact_summary(summary_rows),
-            "rules": self._compact_rules(rules),
-            "triage_summary": self._compact_triage(triage_findings),
-            "output_contract": {
-                "final_decision": "PASS|FAIL|AMBER",
-                "policy_violations": ["string"],
-                "requires_approval": True,
-                "approver_role_required": "Security_Manager",
-            },
-        }
-
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a release policy evaluator. Return JSON only using output_contract.",
+        with self.tracer.start_as_current_span("policy_agent.llm_evaluate") as span:
+            payload = {
+                "summary_rows": self._compact_summary(summary_rows),
+                "rules": self._compact_rules(rules),
+                "triage_summary": self._compact_triage(triage_findings),
+                "output_contract": {
+                    "final_decision": "PASS|FAIL|AMBER",
+                    "policy_violations": ["string"],
+                    "requires_approval": True,
+                    "approver_role_required": "Security_Manager",
                 },
+            }
+
+            span.set_attribute("llm.model", self.model)
+            span.set_attribute("llm.step", "policy_governance_evaluation")
+            span.set_attribute("policy.services_count", len(summary_rows))
+            user_prompt = (
+                "Evaluate release policy from this compact payload and return JSON only. "
+                f"Payload: {json.dumps(payload, separators=(',', ':'))}"
+            )
+            span.set_attribute("llm.prompt_preview", user_prompt[:400])
+
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a release policy evaluator. Return JSON only using output_contract.",
+                    },
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.0,
+                max_tokens=self.max_response_tokens,
+            )
+
+            content = response.choices[0].message.content or "{}"
+            usage = getattr(response, "usage", None)
+            if usage:
+                span.set_attribute("llm.prompt_tokens", int(getattr(usage, "prompt_tokens", 0)))
+                span.set_attribute("llm.completion_tokens", int(getattr(usage, "completion_tokens", 0)))
+                span.set_attribute("llm.total_tokens", int(getattr(usage, "total_tokens", 0)))
+
+            cleaned = content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            try:
+                result = json.loads(cleaned)
+            except json.JSONDecodeError as error:
+                raise ValueError("Policy LLM response was not valid JSON") from error
+
+            violations = result.get("policy_violations", [])
+            span.set_attribute("policy.response_bytes", len(content))
+            span.set_attribute("policy.final_decision", str(result.get("final_decision", "")))
+            span.set_attribute("policy.violations_count", len(violations))
+            span.set_attribute("policy.violations", "; ".join(violations[:5])[:300])
+            span.set_attribute("policy.requires_approval", bool(result.get("requires_approval", False)))
+            span.set_attribute("policy.approver_role", str(result.get("approver_role_required", ""))[:80])
+            span.add_event(
+                "llm.response_received",
                 {
-                    "role": "user",
-                    "content": (
-                        "Evaluate release policy from this compact payload and return JSON only. "
-                        f"Payload: {json.dumps(payload, separators=(',', ':'))}"
-                    ),
+                    "model": self.model,
+                    "final_decision": str(result.get("final_decision", "")),
+                    "violations_count": str(len(violations)),
                 },
-            ],
-            temperature=0.0,
-            max_tokens=self.max_response_tokens,
-        )
+            )
+            print("[LLM][PolicyAgent] Governance response parsed successfully")
 
-        content = response.choices[0].message.content or "{}"
-        cleaned = content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        result = json.loads(cleaned)
-        print("[LLM][PolicyAgent] Governance response parsed successfully")
-
-        return self._normalize_decision(result, summary_rows)
+            return self._normalize_decision(result, summary_rows)
 
     def _compact_summary(self, summary_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         compact_rows = []
@@ -152,7 +213,7 @@ class PolicyAgent:
     def _coerce_int(self, value: Any, default: int = 0) -> int:
         try:
             return int(value)
-        except Exception:
+        except (TypeError, ValueError):
             return default
 
     def _deterministic_evaluate(

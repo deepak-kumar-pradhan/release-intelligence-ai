@@ -1,4 +1,5 @@
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -11,9 +12,20 @@ from fpdf import FPDF
 from src.agents.expert_security_agent import ExpertSecurityAgent
 from src.agents.policy_agent import PolicyAgent
 from src.mcp.mcp_client import MCPClient
+from src.observability import configure_observability, current_trace_id, get_tracer
 
 
 class SecurityReviewWorkflow:
+    _SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9._ -]{1,64}$")
+    _RELEASE_VERSION_RE = re.compile(r"^[A-Za-z0-9._/:-]{1,80}$")
+
+    def _is_placeholder_secret(self, value: str) -> bool:
+        value_normalized = str(value or "").strip()
+        if not value_normalized:
+            return True
+        upper = value_normalized.upper()
+        return upper.startswith("REPLACE_WITH_") or "YOUR_" in upper
+
     def __init__(
         self,
         agents: Optional[List[Any]] = None,
@@ -22,9 +34,12 @@ class SecurityReviewWorkflow:
         policy_agent: Optional[PolicyAgent] = None,
         rules_path: str = "governance/policy.json",
     ):
+        configure_observability()
+        self.tracer = get_tracer("release_intelligence.workflow")
         # Determine if using real tools based on environment variables
         use_real_mcp = bool(os.getenv("SONAR_URL") and os.getenv("CHECKMARX_URL") and os.getenv("MCP_API_KEY"))
-        use_llm = bool(os.getenv("AZURE_OPENAI_ENDPOINT") and os.getenv("AZURE_OPENAI_API_KEY"))
+        llm_api_key = os.getenv("AZURE_OPENAI_API_KEY", "")
+        use_llm = bool(os.getenv("AZURE_OPENAI_ENDPOINT") and not self._is_placeholder_secret(llm_api_key))
         llm_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "")
         llm_model = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
         print(
@@ -42,15 +57,14 @@ class SecurityReviewWorkflow:
         self.policy_agent = policy_agent or PolicyAgent(use_llm=use_llm)
         self.rules_path = rules_path
 
-    def execute(self):
-        return True
+    def execute(self) -> Dict[str, Any]:
+        return self.orchestrate(services=[])
 
-    def orchestrate(self, services: Optional[List[Dict[str, str]]] = None, hitl_approved: bool = False):
-        if services is None:
-            return True
-        return self.run_security_review(services=services, hitl_approved=hitl_approved)
+    def orchestrate(self, services: Optional[List[Dict[str, str]]] = None, hitl_approved: bool = False) -> Dict[str, Any]:
+        normalized_services = self._validate_services(services or [])
+        return self.run_security_review(services=normalized_services, hitl_approved=hitl_approved)
 
-    def fetch_data(self, services: Optional[List[Dict[str, str]]] = None):
+    def fetch_data(self, services: Optional[List[Dict[str, str]]] = None) -> Dict[str, Dict[str, Any]]:
         if services is None:
             return {}
 
@@ -64,7 +78,42 @@ class SecurityReviewWorkflow:
         release_version = service.get("release_version", "main")
         return self.mcp_client.fetch_full_reports(service_name, release_version)
 
-    def aggregate_results(self, results=None):
+    def _validate_services(self, services: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        normalized: List[Dict[str, str]] = []
+
+        for index, service in enumerate(services):
+            if not isinstance(service, dict):
+                raise ValueError(f"Service entry at index {index} must be an object.")
+
+            service_name = str(service.get("service_name", "")).strip()
+            release_version = str(service.get("release_version", "main")).strip() or "main"
+
+            if not service_name:
+                continue
+
+            if not self._SERVICE_NAME_RE.fullmatch(service_name):
+                raise ValueError(
+                    f"Invalid service_name '{service_name}'. Use 1-64 chars: letters, numbers, space, dot, underscore, hyphen."
+                )
+
+            if not self._RELEASE_VERSION_RE.fullmatch(release_version):
+                raise ValueError(
+                    f"Invalid release_version '{release_version}'. Allowed chars: letters, numbers, . _ / : -"
+                )
+
+            normalized.append(
+                {
+                    "service_name": service_name,
+                    "release_version": release_version,
+                }
+            )
+
+        if len(normalized) > 20:
+            raise ValueError("At most 20 services are allowed per review run.")
+
+        return normalized
+
+    def aggregate_results(self, results: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         if results is None:
             return []
 
@@ -99,41 +148,58 @@ class SecurityReviewWorkflow:
         }
 
     def run_security_review(self, services: List[Dict[str, str]], hitl_approved: bool = False) -> Dict[str, Any]:
-        raw_results = self.fetch_data(services)
-        summary_rows = self.aggregate_results(raw_results)
+        with self.tracer.start_as_current_span("workflow.run_security_review") as span:
+            span.set_attribute("services.count", len(services))
+            span.set_attribute("workflow.hitl_approved", hitl_approved)
 
-        deep_dive = {}
-        for service_name, payload in raw_results.items():
-            deep_dive[service_name] = {
-                "raw": payload,
-                "analysis": self.expert_agent.analyze_service_findings(payload),
+            raw_results = self.fetch_data(services)
+            summary_rows = self.aggregate_results(raw_results)
+
+            deep_dive = {}
+            for service_name, payload in raw_results.items():
+                with self.tracer.start_as_current_span("workflow.service_analysis") as service_span:
+                    service_span.set_attribute("service.name", service_name)
+                    deep_dive[service_name] = {
+                        "raw": payload,
+                        "analysis": self.expert_agent.analyze_service_findings(payload),
+                    }
+
+            decision = self._evaluate_governance(summary_rows, deep_dive)
+            critical_count = decision["counts"]["critical"]
+            requires_hitl = bool(decision.get("requires_approval", False)) or critical_count > 0
+            paused_for_hitl = requires_hitl and not hitl_approved
+
+            final_status = "NO-GO" if paused_for_hitl else decision["status"]
+            span.set_attribute("workflow.final_status", final_status)
+            span.set_attribute("workflow.requires_hitl", requires_hitl)
+            span.set_attribute("workflow.paused_for_hitl", paused_for_hitl)
+
+            pdf_path = None
+            if not paused_for_hitl:
+                pdf_path = self.generate_attestation_pdf(
+                    summary_rows=summary_rows,
+                    deep_dive=deep_dive,
+                    status=final_status,
+                    governance_reason=decision["reason"],
+                    governance_decision=decision,
+                )
+                if pdf_path:
+                    span.add_event("pdf.generated", {"pdf.path": pdf_path})
+
+            trace_id = current_trace_id()
+            if trace_id:
+                print(f"[TRACE] workflow.run_security_review trace_id={trace_id}")
+
+            return {
+                "summary": summary_rows,
+                "deep_dive": deep_dive,
+                "governance": decision,
+                "requires_hitl": requires_hitl,
+                "paused_for_hitl": paused_for_hitl,
+                "status": final_status,
+                "attestation_pdf": pdf_path,
+                "trace_id": trace_id,
             }
-
-        decision = self._evaluate_governance(summary_rows, deep_dive)
-        critical_count = decision["counts"]["critical"]
-        requires_hitl = bool(decision.get("requires_approval", False)) or critical_count > 0
-        paused_for_hitl = requires_hitl and not hitl_approved
-
-        final_status = "NO-GO" if paused_for_hitl else decision["status"]
-        pdf_path = None
-        if not paused_for_hitl:
-            pdf_path = self.generate_attestation_pdf(
-                summary_rows=summary_rows,
-                deep_dive=deep_dive,
-                status=final_status,
-                governance_reason=decision["reason"],
-                governance_decision=decision,
-            )
-
-        return {
-            "summary": summary_rows,
-            "deep_dive": deep_dive,
-            "governance": decision,
-            "requires_hitl": requires_hitl,
-            "paused_for_hitl": paused_for_hitl,
-            "status": final_status,
-            "attestation_pdf": pdf_path,
-        }
 
     def _evaluate_governance(self, summary_rows: List[Dict[str, Any]], deep_dive: Dict[str, Any]) -> Dict[str, Any]:
         rules = self._load_rules()
@@ -227,10 +293,10 @@ class SecurityReviewWorkflow:
         pdf.set_text_color(255, 255, 255)
         pdf.set_xy(pdf.l_margin, 10)
         pdf.set_font("Helvetica", "B", 20)
-        pdf.cell(content_width, 10, "Release Attestation", ln=True)
+        pdf.cell(content_width, 10, "Release Attestation", new_x="LMARGIN", new_y="NEXT")
         pdf.set_font("Helvetica", size=10)
         pdf.set_x(pdf.l_margin)
-        pdf.cell(content_width, 6, f"Generated: {generated_at}", ln=True)
+        pdf.cell(content_width, 6, f"Generated: {generated_at}", new_x="LMARGIN", new_y="NEXT")
 
         pdf.set_text_color(0, 0, 0)
         pdf.set_y(40)
@@ -240,7 +306,7 @@ class SecurityReviewWorkflow:
         pdf.set_text_color(255, 255, 255)
         pdf.set_font("Helvetica", "B", 12)
         pdf.set_x(pdf.l_margin)
-        pdf.cell(52, 10, f"Executive Status: {status}", border=0, ln=True, fill=True)
+        pdf.cell(52, 10, f"Executive Status: {status}", border=0, fill=True, new_x="LMARGIN", new_y="NEXT")
         pdf.set_text_color(0, 0, 0)
         pdf.ln(2)
 
@@ -255,7 +321,7 @@ class SecurityReviewWorkflow:
 
         pdf.set_font("Helvetica", "B", 11)
         pdf.set_x(pdf.l_margin)
-        pdf.cell(content_width, 7, "Policy Decision", ln=True)
+        pdf.cell(content_width, 7, "Policy Decision", new_x="LMARGIN", new_y="NEXT")
         pdf.set_fill_color(242, 247, 255)
         pdf.set_draw_color(180, 200, 225)
         box_y = pdf.get_y()
@@ -263,19 +329,25 @@ class SecurityReviewWorkflow:
         pdf.rect(pdf.l_margin, box_y, content_width, box_h, style="DF")
         pdf.set_xy(pdf.l_margin + 2, box_y + 2)
         pdf.set_font("Helvetica", size=10)
-        pdf.cell(content_width - 4, 5, f"Final Decision: {final_decision}", ln=True)
+        pdf.cell(content_width - 4, 5, f"Final Decision: {final_decision}", new_x="LMARGIN", new_y="NEXT")
         pdf.set_x(pdf.l_margin + 2)
-        pdf.cell(content_width - 4, 5, f"Requires Approval: {requires_approval} | Approver Role: {approver_role}", ln=True)
+        pdf.cell(
+            content_width - 4,
+            5,
+            f"Requires Approval: {requires_approval} | Approver Role: {approver_role}",
+            new_x="LMARGIN",
+            new_y="NEXT",
+        )
         violations_text = ", ".join(policy_violations) if policy_violations else "none"
         pdf.set_x(pdf.l_margin + 2)
-        pdf.cell(content_width - 4, 5, f"Policy Violations: {violations_text[:140]}", ln=True)
+        pdf.cell(content_width - 4, 5, f"Policy Violations: {violations_text[:140]}", new_x="LMARGIN", new_y="NEXT")
         pdf.set_y(box_y + box_h + 2)
 
         justification_request = decision_record.get("justification_request")
         if justification_request:
             pdf.set_font("Helvetica", "B", 10)
             pdf.set_x(pdf.l_margin)
-            pdf.cell(content_width, 6, "HITL Justification Request", ln=True)
+            pdf.cell(content_width, 6, "HITL Justification Request", new_x="LMARGIN", new_y="NEXT")
             pdf.set_font("Helvetica", size=10)
             write_block(justification_request, line_height=6)
 
@@ -304,13 +376,13 @@ class SecurityReviewWorkflow:
 
         pdf.set_font("Helvetica", "B", 12)
         pdf.set_x(pdf.l_margin)
-        pdf.cell(content_width, 8, "Summary", ln=True)
+        pdf.cell(content_width, 8, "Summary", new_x="LMARGIN", new_y="NEXT")
         self._draw_summary_table(pdf, summary_rows, content_width)
         pdf.ln(3)
 
         pdf.set_font("Helvetica", "B", 12)
         pdf.set_x(pdf.l_margin)
-        pdf.cell(content_width, 8, "Vulnerability Distribution", ln=True)
+        pdf.cell(content_width, 8, "Vulnerability Distribution", new_x="LMARGIN", new_y="NEXT")
         self._draw_summary_chart(pdf, summary_rows, content_width)
 
         for service_name, details in deep_dive.items():
@@ -320,13 +392,13 @@ class SecurityReviewWorkflow:
             pdf.set_font("Helvetica", "B", 13)
             pdf.set_x(pdf.l_margin)
             pdf.set_y(7)
-            pdf.cell(content_width, 8, f"Deep Dive - {service_name}", ln=True)
+            pdf.cell(content_width, 8, f"Deep Dive - {service_name}", new_x="LMARGIN", new_y="NEXT")
             pdf.set_font("Helvetica", size=10)
             pdf.set_y(22)
             analyses = details.get("analysis", [])
             if not analyses:
                 pdf.set_x(pdf.l_margin)
-                pdf.cell(content_width, 7, "No findings.", ln=True)
+                pdf.cell(content_width, 7, "No findings.", new_x="LMARGIN", new_y="NEXT")
                 continue
 
             for item in analyses:
@@ -347,8 +419,9 @@ class SecurityReviewWorkflow:
                     8,
                     f"{severity} | {item.get('finding_id', 'N/A')} | {label}",
                     border=0,
-                    ln=True,
                     fill=True,
+                    new_x="LMARGIN",
+                    new_y="NEXT",
                 )
 
                 pdf.set_text_color(0, 0, 0)

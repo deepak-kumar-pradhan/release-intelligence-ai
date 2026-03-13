@@ -1,4 +1,5 @@
 from copy import deepcopy
+import re
 
 
 class MockMCPServers:
@@ -87,8 +88,24 @@ class MockMCPServers:
             },
         }
 
+    def _canonicalize_service_name(self, service_name: str) -> str:
+        # Normalize separators and case so Service A / Service-A / service_a resolve to the same mock key.
+        return re.sub(r"[\s_-]+", "", str(service_name or "").strip().lower())
+
+    def _resolve_service_key(self, service_name: str, dataset: dict) -> str:
+        if service_name in dataset:
+            return service_name
+
+        target = self._canonicalize_service_name(service_name)
+        for key in dataset.keys():
+            if self._canonicalize_service_name(key) == target:
+                return key
+
+        return service_name
+
     def get_sonar_report(self, service_name: str, branch_name: str) -> dict:
-        report = deepcopy(self._sonar_data.get(service_name, {
+        resolved_key = self._resolve_service_key(service_name, self._sonar_data)
+        report = deepcopy(self._sonar_data.get(resolved_key, {
             "status": "OK",
             "issues": [],
             "branch": branch_name,
@@ -97,7 +114,8 @@ class MockMCPServers:
         return report
 
     def get_checkmarx_report(self, service_name: str, branch_name: str) -> dict:
-        report = deepcopy(self._checkmarx_data.get(service_name, {
+        resolved_key = self._resolve_service_key(service_name, self._checkmarx_data)
+        report = deepcopy(self._checkmarx_data.get(resolved_key, {
             "sast": {"critical": 0, "high": 0, "findings": []},
             "sca": {"critical": 0, "high": 0, "findings": []},
         }))

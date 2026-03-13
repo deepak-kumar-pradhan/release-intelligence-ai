@@ -15,7 +15,10 @@ class TestSecurityReviewWorkflow(unittest.TestCase):
 
     def test_orchestrate_workflow(self):
         result = self.workflow.orchestrate()
-        self.assertTrue(result)  # Assuming orchestrate returns a boolean indicating success
+        self.assertIsInstance(result, dict)
+        self.assertIn("status", result)
+        self.assertIn("summary", result)
+        self.assertIn("governance", result)
 
     def test_aggregate_results(self):
         results = self.workflow.aggregate_results()

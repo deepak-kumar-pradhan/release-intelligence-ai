@@ -33,7 +33,22 @@ def _save_manifest(services):
 def _load_manifest():
     if not MANIFEST_PATH.exists():
         return {"services": [], "session": "default"}
-    return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        st.error("release_manifest.json is invalid JSON. Please save the manifest again.")
+        return {"services": [], "session": "default"}
+
+    if not isinstance(payload, dict):
+        st.error("release_manifest.json must be a JSON object.")
+        return {"services": [], "session": "default"}
+
+    services = payload.get("services", [])
+    if not isinstance(services, list):
+        st.error("release_manifest.json field 'services' must be a list.")
+        return {"services": [], "session": "default"}
+
+    return payload
 
 
 def _render_service_inputs():
@@ -77,11 +92,20 @@ def _render_workflow_controls():
     workflow = SecurityReviewWorkflow()
 
     if st.button("Run Security Review"):
-        st.session_state.workflow_result = workflow.orchestrate(services=services, hitl_approved=False)
+        try:
+            st.session_state.workflow_result = workflow.orchestrate(services=services, hitl_approved=False)
+        except ValueError as error:
+            st.error(f"Input validation failed: {error}")
+            st.session_state.workflow_result = None
+            return
 
     result = st.session_state.workflow_result
     if not result:
         return
+
+    if result.get("trace_id"):
+        st.write("### Trace")
+        st.code(result["trace_id"])
 
     st.write("### Stage 2 Aggregated Summary")
     st.table(result["summary"])
@@ -112,17 +136,20 @@ def _render_workflow_controls():
             if not approved:
                 st.error("Approval is required before final attestation.")
             else:
-                final = workflow.orchestrate(services=services, hitl_approved=True)
-                st.session_state.workflow_result = final
-                st.success(f"Final Status: {final['status']}")
-                if final.get("attestation_pdf"):
-                    pdf_file = Path(final["attestation_pdf"])
-                    st.download_button(
-                        label="Download Release Attestation PDF",
-                        data=pdf_file.read_bytes(),
-                        file_name=pdf_file.name,
-                        mime="application/pdf",
-                    )
+                try:
+                    final = workflow.orchestrate(services=services, hitl_approved=True)
+                    st.session_state.workflow_result = final
+                    st.success(f"Final Status: {final['status']}")
+                    if final.get("attestation_pdf"):
+                        pdf_file = Path(final["attestation_pdf"])
+                        st.download_button(
+                            label="Download Release Attestation PDF",
+                            data=pdf_file.read_bytes(),
+                            file_name=pdf_file.name,
+                            mime="application/pdf",
+                        )
+                except ValueError as error:
+                    st.error(f"Input validation failed: {error}")
         return
 
     if result.get("attestation_pdf"):
@@ -146,7 +173,13 @@ def main():
 
     llm_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
     llm_model = os.getenv("AZURE_OPENAI_DEPLOYMENT")
-    llm_enabled = bool(llm_endpoint and os.getenv("AZURE_OPENAI_API_KEY"))
+    llm_api_key = os.getenv("AZURE_OPENAI_API_KEY", "")
+    llm_enabled = bool(
+        llm_endpoint
+        and llm_api_key
+        and not llm_api_key.upper().startswith("REPLACE_WITH_")
+        and "YOUR_" not in llm_api_key.upper()
+    )
     st.info(
         f"LLM Runtime: {'Enabled' if llm_enabled else 'Disabled'} | Model: {llm_model or 'not set'} | Endpoint: {llm_endpoint or 'not set'}"
     )

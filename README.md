@@ -69,9 +69,10 @@ To use actual tools instead of mock data, set the following environment variable
 #### Azure OpenAI (for AI Analysis)
 ```bash
 export AZURE_OPENAI_API_KEY="your-azure-openai-api-key"
-export AZURE_OPENAI_ENDPOINT="https://your-resource.openai.azure.com/"
-export AZURE_OPENAI_DEPLOYMENT="gpt-4o"
-export AZURE_OPENAI_API_VERSION="2024-08-01-preview"
+export AZURE_OPENAI_ENDPOINT="https://your-resource.openai.azure.com/openai/v1"
+export AZURE_OPENAI_DEPLOYMENT="gpt-4o-mini"
+export AZURE_OPENAI_API_VERSION="2024-07-18"
+export APPLICATIONINSIGHTS_CONNECTION_STRING="InstrumentationKey=...;IngestionEndpoint=https://..."
 ```
 
 #### SonarQube and Checkmarx (for Security Scanning)
@@ -89,6 +90,25 @@ export MCP_API_KEY="your-api-key-for-tools"
 3. Set the above environment variables in your Azure AI Foundry environment.
 
 For detailed deployment steps, refer to [Azure AI Foundry documentation](https://learn.microsoft.com/en-us/azure/ai-studio/).
+
+### Azure Tracing for Hackathon Demo
+To show Microsoft-native reasoning traces during your walkthrough, configure Application Insights / Azure Monitor and restart the app.
+
+1. Create or reuse an Application Insights resource in Azure.
+2. Copy its connection string into `APPLICATIONINSIGHTS_CONNECTION_STRING`.
+3. Rebuild and run the app.
+4. Run a security review and copy the `trace_id` shown in the UI.
+5. In Azure Portal, open Application Insights -> Transaction Search or Logs and filter by that trace ID.
+
+You will see spans such as:
+- `workflow.run_security_review`
+- `workflow.service_analysis`
+- `expert_security_agent.analyze_service_findings`
+- `expert_security_agent.llm_analyze_finding`
+- `policy_agent.evaluate_release`
+- `policy_agent.llm_evaluate`
+
+This is the strongest Microsoft demo path because it combines Azure AI Foundry model hosting with Azure Monitor traces for agent reasoning flow.
 
 ## Running the Application
 
