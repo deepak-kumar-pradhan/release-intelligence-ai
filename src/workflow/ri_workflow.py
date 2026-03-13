@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 import textwrap
 from typing import Any, Dict, List, Optional
+import os
 
 from fpdf import FPDF
 
@@ -21,10 +22,24 @@ class SecurityReviewWorkflow:
         policy_agent: Optional[PolicyAgent] = None,
         rules_path: str = "governance/policy.json",
     ):
+        # Determine if using real tools based on environment variables
+        use_real_mcp = bool(os.getenv("SONAR_URL") and os.getenv("CHECKMARX_URL") and os.getenv("MCP_API_KEY"))
+        use_llm = bool(os.getenv("AZURE_OPENAI_ENDPOINT") and os.getenv("AZURE_OPENAI_API_KEY"))
+        llm_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+        llm_model = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+        print(
+            f"[WORKFLOW] Boot use_llm={use_llm} model={llm_model} endpoint={llm_endpoint or 'missing'} use_real_mcp={use_real_mcp}"
+        )
+        
         self.agents = agents or []
-        self.mcp_client = mcp_client or MCPClient(use_mock=True)
-        self.expert_agent = expert_agent or ExpertSecurityAgent(use_llm=False)
-        self.policy_agent = policy_agent or PolicyAgent(use_llm=False)
+        self.mcp_client = mcp_client or MCPClient(
+            sonar_url=os.getenv("SONAR_URL", ""),
+            checkmarx_url=os.getenv("CHECKMARX_URL", ""),
+            api_key=os.getenv("MCP_API_KEY", ""),
+            use_mock=not use_real_mcp
+        )
+        self.expert_agent = expert_agent or ExpertSecurityAgent(use_llm=use_llm)
+        self.policy_agent = policy_agent or PolicyAgent(use_llm=use_llm)
         self.rules_path = rules_path
 
     def execute(self):

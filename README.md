@@ -63,14 +63,32 @@ source .venv/bin/activate  # macOS/Linux
 pip install -r requirements.txt
 ```
 
-### 4. (Optional) Configure Azure OpenAI
-If you want to enable GPT-4o analysis, set environment variables:
+### 4. Configure for Live Demo with Real Tools
+To use actual tools instead of mock data, set the following environment variables:
+
+#### Azure OpenAI (for AI Analysis)
 ```bash
-export AZURE_OPENAI_API_KEY="your-api-key"
-export AZURE_OPENAI_ENDPOINT="https://your-endpoint.openai.azure.com/"
+export AZURE_OPENAI_API_KEY="your-azure-openai-api-key"
+export AZURE_OPENAI_ENDPOINT="https://your-resource.openai.azure.com/"
 export AZURE_OPENAI_DEPLOYMENT="gpt-4o"
+export AZURE_OPENAI_API_VERSION="2024-08-01-preview"
 ```
-*Note: System works with deterministic fallback if Azure OpenAI is not configured.*
+
+#### SonarQube and Checkmarx (for Security Scanning)
+```bash
+export SONAR_URL="https://your-sonarqube-instance.com"
+export CHECKMARX_URL="https://your-checkmarx-instance.com"
+export MCP_API_KEY="your-api-key-for-tools"
+```
+
+*Note: If these are not set, the system defaults to mock data for development.*
+
+#### Deploy to Azure AI Foundry (Microsoft Foundry)
+1. Create an Azure AI Foundry project.
+2. Use the Azure AI SDK to deploy the workflow as an AI app.
+3. Set the above environment variables in your Azure AI Foundry environment.
+
+For detailed deployment steps, refer to [Azure AI Foundry documentation](https://learn.microsoft.com/en-us/azure/ai-studio/).
 
 ## Running the Application
 
@@ -100,6 +118,14 @@ result = workflow.orchestrate(services=services, hitl_approved=True)
 print(f"Status: {result['status']}")
 print(f"PDF: {result['attestation_pdf']}")
 ```
+
+### Demo Script
+Run a quick demo with mock data:
+```bash
+python demo.py
+```
+
+For live demo with real tools, set the environment variables above and run the same script.
 
 ## Key Features
 

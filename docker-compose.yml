@@ -8,8 +8,6 @@ services:
     volumes:
       - ./reports:/app/reports
       - ./session:/app/session
-    environment:
-      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
-      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
-      AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:-}
+    env_file:
+      - ./infra/.env.foundry
     restart: unless-stopped

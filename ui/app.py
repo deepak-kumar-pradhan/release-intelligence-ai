@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -142,6 +143,13 @@ def main():
     st.set_page_config(page_title="Release Intelligence", layout="wide")
     st.title("Release Intelligence (RI) - Security Review")
     st.caption("MCP fetch + AI analysis + HITL attestation")
+
+    llm_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    llm_model = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+    llm_enabled = bool(llm_endpoint and os.getenv("AZURE_OPENAI_API_KEY"))
+    st.info(
+        f"LLM Runtime: {'Enabled' if llm_enabled else 'Disabled'} | Model: {llm_model or 'not set'} | Endpoint: {llm_endpoint or 'not set'}"
+    )
 
     _render_service_inputs()
     st.divider()

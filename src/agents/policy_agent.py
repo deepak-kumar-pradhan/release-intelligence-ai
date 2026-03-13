@@ -1,55 +1,63 @@
 import json
 import os
-from typing import Any, Dict, List
-
-from .agent_instructions import POLICY_AGENT_SYSTEM_PROMPT
+from typing import Any, Dict, List, Optional
 
 try:
-    from openai import AzureOpenAI
+    from openai import OpenAI
 except Exception:
-    AzureOpenAI = None
+    OpenAI = None
 
 
 class PolicyAgent:
     def __init__(self, use_llm: bool = False):
         self.use_llm = use_llm
         self.model = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+        self.max_response_tokens = self._coerce_int(os.getenv("POLICY_LLM_MAX_RESPONSE_TOKENS", "180"), default=180)
         self.client = self._build_client() if use_llm else None
+        if not use_llm:
+            print("[LLM][PolicyAgent] Disabled: missing AZURE_OPENAI_ENDPOINT/API_KEY")
 
     def _build_client(self):
-        if AzureOpenAI is None:
+        if OpenAI is None:
+            print("[LLM][PolicyAgent] OpenAI SDK import failed")
             return None
 
         endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
         api_key = os.getenv("AZURE_OPENAI_API_KEY")
-        api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
         if not endpoint or not api_key:
+            print("[LLM][PolicyAgent] Missing endpoint or api_key")
             return None
 
-        return AzureOpenAI(
+        print(
+            f"[LLM][PolicyAgent] Initializing client model={self.model} endpoint={endpoint} api_key={'set' if api_key else 'missing'}"
+        )
+
+        return OpenAI(
+            base_url=endpoint,
             api_key=api_key,
-            azure_endpoint=endpoint,
-            api_version=api_version,
         )
 
     def evaluate_release(
         self,
         summary_rows: List[Dict[str, Any]],
         rules: Dict[str, Any],
-        triage_findings: Dict[str, Any] | None = None,
+        triage_findings: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if self.client:
             try:
+                print("[LLM][PolicyAgent] Evaluating governance with LLM")
                 return self._llm_evaluate(summary_rows, rules, triage_findings or {})
-            except Exception:
+            except Exception as error:
+                print(f"[LLM][PolicyAgent] LLM evaluation failed, using deterministic path: {error}")
                 return self._deterministic_evaluate(summary_rows, rules, triage_findings or {})
+        print("[LLM][PolicyAgent] Using deterministic policy path")
         return self._deterministic_evaluate(summary_rows, rules, triage_findings or {})
 
     def _llm_evaluate(self, summary_rows: List[Dict[str, Any]], rules: Dict[str, Any], triage_findings: Dict[str, Any]) -> Dict[str, Any]:
         payload = {
-            "summary_rows": summary_rows,
-            "rules": rules,
-            "triage_findings": triage_findings,
+            "summary_rows": self._compact_summary(summary_rows),
+            "rules": self._compact_rules(rules),
+            "triage_summary": self._compact_triage(triage_findings),
             "output_contract": {
                 "final_decision": "PASS|FAIL|AMBER",
                 "policy_violations": ["string"],
@@ -61,23 +69,91 @@ class PolicyAgent:
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": POLICY_AGENT_SYSTEM_PROMPT},
+                {
+                    "role": "system",
+                    "content": "You are a release policy evaluator. Return JSON only using output_contract.",
+                },
                 {
                     "role": "user",
                     "content": (
-                        "Evaluate release policy from this payload and return JSON only. "
-                        f"Payload: {json.dumps(payload)}"
+                        "Evaluate release policy from this compact payload and return JSON only. "
+                        f"Payload: {json.dumps(payload, separators=(',', ':'))}"
                     ),
                 },
             ],
             temperature=0.0,
+            max_tokens=self.max_response_tokens,
         )
 
         content = response.choices[0].message.content or "{}"
         cleaned = content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         result = json.loads(cleaned)
+        print("[LLM][PolicyAgent] Governance response parsed successfully")
 
         return self._normalize_decision(result, summary_rows)
+
+    def _compact_summary(self, summary_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        compact_rows = []
+        for row in summary_rows:
+            compact_rows.append(
+                {
+                    "service": row.get("service_name"),
+                    "version": row.get("release_version"),
+                    "sonar": row.get("sonar_status"),
+                    "sast_c": row.get("checkmarx_sast", {}).get("critical", 0),
+                    "sast_h": row.get("checkmarx_sast", {}).get("high", 0),
+                    "sca_c": row.get("checkmarx_sca", {}).get("critical", 0),
+                    "sca_h": row.get("checkmarx_sca", {}).get("high", 0),
+                }
+            )
+        return compact_rows
+
+    def _compact_rules(self, rules: Dict[str, Any]) -> Dict[str, Any]:
+        quality_gates = rules.get("quality_gates", {})
+        return {
+            "sonar_required": quality_gates.get("sonarqube", {}).get("min_quality_gate_status", "PASSED"),
+            "sast_block_on": quality_gates.get("checkmarx_sast", {}).get("block_on", ["CRITICAL", "HIGH"]),
+            "sca_max_cvss": quality_gates.get("checkmarx_sca", {}).get("max_cvss_score_allowed", 8.9),
+            "approval_role": rules.get("agentic_rules", {}).get("human_in_the_loop", {}).get("required_role", "Security_Manager"),
+        }
+
+    def _compact_triage(self, triage_findings: Dict[str, Any]) -> Dict[str, Any]:
+        top_findings = []
+        warning_count = 0
+        blocker_count = 0
+
+        for service_name, payload in triage_findings.items():
+            analyses = payload.get("analysis", []) if isinstance(payload, dict) else []
+            for item in analyses:
+                category = str(item.get("category", "")).upper()
+                if category == "WARNING":
+                    warning_count += 1
+                if category == "BLOCKER":
+                    blocker_count += 1
+
+                top_findings.append(
+                    {
+                        "service": service_name,
+                        "id": item.get("finding_id", item.get("issue_id", "unknown")),
+                        "severity": item.get("severity", "UNKNOWN"),
+                        "category": item.get("category", "N/A"),
+                        "impact": item.get("impact_score", 0),
+                        "false_positive": bool(item.get("is_false_positive", item.get("false_positive", False))),
+                    }
+                )
+
+        top_findings = sorted(top_findings, key=lambda x: int(x.get("impact", 0)), reverse=True)[:6]
+        return {
+            "warning_count": warning_count,
+            "blocker_count": blocker_count,
+            "top_findings": top_findings,
+        }
+
+    def _coerce_int(self, value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default
 
     def _deterministic_evaluate(
         self,
