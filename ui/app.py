@@ -17,6 +17,7 @@ from src.workflow.ri_workflow import SecurityReviewWorkflow
 SESSION_DIR = ROOT / "session"
 MANIFEST_PATH = SESSION_DIR / "release_manifest.json"
 REPORTS_DIR = ROOT / "reports"
+LEDGER_PATH = SESSION_DIR / "evidence_ledger.jsonl"
 
 
 def _inject_ui_theme():
@@ -459,6 +460,27 @@ def _get_report_files():
     return sorted(REPORTS_DIR.glob("release_attestation_*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True)
 
 
+def _load_evidence_records():
+    if not LEDGER_PATH.exists():
+        return []
+
+    records = []
+    for raw_line in LEDGER_PATH.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        records.append(payload)
+
+    records.sort(key=lambda item: str(item.get("generated_at", "")), reverse=True)
+    return records
+
+
 def _render_report_history_panel():
     report_files = _get_report_files()
     count = len(report_files)
@@ -502,35 +524,96 @@ def _render_report_history_panel():
 
 def _render_report_history_page():
     st.subheader("Report History")
-    st.markdown('<div class="ri-card"><span class="ri-subtle">All previously generated attestation PDFs.</span></div>', unsafe_allow_html=True)
-
-    report_files = _get_report_files()
-    if not report_files:
-        st.info("No previous attestation reports found yet.")
-        return
-
-    history_rows = []
-    for path in report_files:
-        stat = path.stat()
-        history_rows.append(
-            {
-                "Report": path.name,
-                "Generated": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-                "Size": _format_file_size(stat.st_size),
-            }
-        )
-
-    history_df = pd.DataFrame.from_records(history_rows)
-    st.dataframe(history_df, use_container_width=True, hide_index=True)
-
-    selected_name = st.selectbox(
-        "Select report to download",
-        options=[p.name for p in report_files],
-        index=0,
-        key="report_history_page_select",
+    st.markdown(
+        '<div class="ri-card"><span class="ri-subtle">Audit-ready report evidence with governance and reviewer context.</span></div>',
+        unsafe_allow_html=True,
     )
-    selected_path = next((p for p in report_files if p.name == selected_name), None)
-    if selected_path:
+
+    records = _load_evidence_records()
+    if records:
+        all_statuses = sorted({str(item.get("status", "UNKNOWN")) for item in records})
+        status_filter_col, reviewer_filter_col, service_filter_col = st.columns([1.1, 1.2, 1.2])
+        with status_filter_col:
+            status_filter = st.selectbox(
+                "Status",
+                options=["All"] + all_statuses,
+                index=0,
+                key="history_status_filter",
+            )
+        with reviewer_filter_col:
+            reviewer_filter = st.text_input(
+                "Reviewer",
+                value="",
+                placeholder="Filter by reviewer name",
+                key="history_reviewer_filter",
+            ).strip().lower()
+        with service_filter_col:
+            service_filter = st.text_input(
+                "Service",
+                value="",
+                placeholder="Filter by service",
+                key="history_service_filter",
+            ).strip().lower()
+
+        filtered = []
+        for item in records:
+            item_status = str(item.get("status", "UNKNOWN"))
+            item_reviewer = str(item.get("reviewer_name", "") or "")
+            item_services = item.get("services", [])
+            service_blob = ", ".join(item_services) if isinstance(item_services, list) else str(item_services)
+
+            if status_filter != "All" and item_status != status_filter:
+                continue
+            if reviewer_filter and reviewer_filter not in item_reviewer.lower():
+                continue
+            if service_filter and service_filter not in service_blob.lower():
+                continue
+            filtered.append(item)
+
+        if not filtered:
+            st.info("No report records match the current filters.")
+            return
+
+        history_rows = []
+        for item in filtered:
+            report_path = str(item.get("report_path") or "")
+            report_name = Path(report_path).name if report_path else "N/A"
+            history_rows.append(
+                {
+                    "Generated": str(item.get("generated_at", "N/A")),
+                    "Run ID": str(item.get("run_id", "N/A")),
+                    "Status": str(item.get("status", "N/A")),
+                    "Reviewer": str(item.get("reviewer_name") or "-"),
+                    "Services": ", ".join(item.get("services", [])) if isinstance(item.get("services"), list) else "-",
+                    "Report": report_name,
+                }
+            )
+
+        history_df = pd.DataFrame.from_records(history_rows)
+        st.dataframe(history_df, use_container_width=True, hide_index=True)
+
+        downloadable_records = [
+            item
+            for item in filtered
+            if str(item.get("report_path") or "") and Path(str(item.get("report_path"))).exists()
+        ]
+        if not downloadable_records:
+            st.info("No downloadable report file found for the selected records.")
+            return
+
+        options = []
+        for item in downloadable_records:
+            report_name = Path(str(item.get("report_path"))).name
+            options.append(f"{item.get('generated_at', 'N/A')} | {item.get('status', 'N/A')} | {report_name}")
+
+        selected_option = st.selectbox(
+            "Select report to download",
+            options=options,
+            index=0,
+            key="report_history_page_select",
+        )
+        selected_record = downloadable_records[options.index(selected_option)]
+        selected_path = Path(str(selected_record.get("report_path")))
         st.download_button(
             label="Download Selected Report",
             data=selected_path.read_bytes(),
@@ -538,6 +621,25 @@ def _render_report_history_page():
             mime="application/pdf",
             key="report_history_page_download",
         )
+        return
+
+    # Backward compatibility: if ledger is absent, fall back to files-only history.
+    report_files = _get_report_files()
+    if not report_files:
+        st.info("No previous attestation reports found yet.")
+        return
+
+    fallback_rows = []
+    for path in report_files:
+        stat = path.stat()
+        fallback_rows.append(
+            {
+                "Report": path.name,
+                "Generated": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                "Size": _format_file_size(stat.st_size),
+            }
+        )
+    st.dataframe(pd.DataFrame.from_records(fallback_rows), use_container_width=True, hide_index=True)
 
 
 def _save_manifest(services):

@@ -1,11 +1,13 @@
 import json
 import re
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 import textwrap
 from typing import Any, Dict, List, Optional
 import os
+from uuid import uuid4
 
 from fpdf import FPDF
 
@@ -18,6 +20,7 @@ from src.observability import configure_observability, current_trace_id, get_tra
 class SecurityReviewWorkflow:
     _SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9._ -]{1,64}$")
     _RELEASE_VERSION_RE = re.compile(r"^[A-Za-z0-9._/:-]{1,80}$")
+    _VALID_REVIEWER_ACTIONS = {"APPROVED", "REJECTED"}
 
     def _is_placeholder_secret(self, value: str) -> bool:
         value_normalized = str(value or "").strip()
@@ -56,6 +59,7 @@ class SecurityReviewWorkflow:
         self.expert_agent = expert_agent or ExpertSecurityAgent(use_llm=use_llm)
         self.policy_agent = policy_agent or PolicyAgent(use_llm=use_llm)
         self.rules_path = rules_path
+        self.ledger_path = Path("session") / "evidence_ledger.jsonl"
 
     def execute(self) -> Dict[str, Any]:
         return self.orchestrate(services=[])
@@ -166,8 +170,15 @@ class SecurityReviewWorkflow:
         reviewer_action: str = "",
     ) -> Dict[str, Any]:
         with self.tracer.start_as_current_span("workflow.run_security_review") as span:
+            run_id = self._new_run_id()
             span.set_attribute("services.count", len(services))
             span.set_attribute("workflow.hitl_approved", hitl_approved)
+            span.set_attribute("workflow.run_id", run_id)
+
+            reviewer_action_normalized = self._validate_reviewer_action(reviewer_action)
+            reviewer_name_clean = reviewer_name.strip()
+            if reviewer_action_normalized and not reviewer_name_clean:
+                raise ValueError("Reviewer name is required when manual action is provided.")
 
             raw_results = self.fetch_data(services)
             summary_rows = self.aggregate_results(raw_results)
@@ -190,11 +201,11 @@ class SecurityReviewWorkflow:
                 requires_hitl = False
 
             # If a reviewer has explicitly acted, do not pause — use their decision
-            reviewer_acted = bool(reviewer_action.strip())
+            reviewer_acted = bool(reviewer_action_normalized)
             paused_for_hitl = requires_hitl and not hitl_approved and not reviewer_acted
 
             if reviewer_acted:
-                final_status = "GO" if reviewer_action.upper() == "APPROVED" else "REJECTED"
+                final_status = "GO" if reviewer_action_normalized == "APPROVED" else "REJECTED"
             else:
                 final_status = "NO-GO" if paused_for_hitl else decision["status"]
             span.set_attribute("workflow.final_status", final_status)
@@ -220,8 +231,8 @@ class SecurityReviewWorkflow:
                     status=final_status,
                     governance_reason=decision["reason"],
                     governance_decision=decision,
-                    reviewer_name=reviewer_name or None,
-                    reviewer_action=reviewer_action or None,
+                    reviewer_name=reviewer_name_clean or None,
+                    reviewer_action=reviewer_action_normalized or None,
                 )
             if pdf_path:
                 span.add_event("pdf.generated", {"pdf.path": pdf_path})
@@ -230,7 +241,29 @@ class SecurityReviewWorkflow:
             if trace_id:
                 print(f"[TRACE] workflow.run_security_review trace_id={trace_id}")
 
+            self._append_evidence_record(
+                {
+                    "run_id": run_id,
+                    "generated_at": datetime.now().isoformat(timespec="seconds"),
+                    "status": final_status,
+                    "requires_hitl": requires_hitl,
+                    "paused_for_hitl": paused_for_hitl,
+                    "policy_version": decision.get("policy_version", "unknown"),
+                    "policy_decision": final_decision_str,
+                    "policy_reason": decision.get("reason", ""),
+                    "critical_count": int(decision.get("counts", {}).get("critical", 0)),
+                    "high_count": int(decision.get("counts", {}).get("high", 0)),
+                    "services": [item.get("service_name", "") for item in services],
+                    "reviewer_name": reviewer_name_clean or None,
+                    "reviewer_action": reviewer_action_normalized or None,
+                    "report_path": pdf_path,
+                    "report_sha256": self._sha256_file(pdf_path),
+                    "trace_id": trace_id,
+                }
+            )
+
             return {
+                "run_id": run_id,
                 "summary": summary_rows,
                 "deep_dive": deep_dive,
                 "governance": decision,
@@ -239,16 +272,52 @@ class SecurityReviewWorkflow:
                 "status": final_status,
                 "attestation_pdf": pdf_path,
                 "trace_id": trace_id,
+                "reviewer_name": reviewer_name_clean or None,
+                "reviewer_action": reviewer_action_normalized or None,
             }
 
     def _evaluate_governance(self, summary_rows: List[Dict[str, Any]], deep_dive: Dict[str, Any]) -> Dict[str, Any]:
         rules = self._load_rules()
+        policy_version = rules.get("policy_metadata", {}).get("version", "unknown")
         result = self.policy_agent.evaluate_release(summary_rows, rules, deep_dive)
         result.setdefault("status", "NO-GO")
         result.setdefault("reason", "Governance evaluation completed.")
         result.setdefault("counts", {"critical": 0, "high": 0})
         result.setdefault("requires_approval", False)
+        result.setdefault("policy_version", policy_version)
         return result
+
+    def _new_run_id(self) -> str:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"run_{timestamp}_{uuid4().hex[:8]}"
+
+    def _validate_reviewer_action(self, action: str) -> str:
+        normalized = str(action or "").strip().upper()
+        if not normalized:
+            return ""
+        if normalized not in self._VALID_REVIEWER_ACTIONS:
+            raise ValueError(
+                f"Invalid reviewer_action '{action}'. Allowed values: APPROVED or REJECTED."
+            )
+        return normalized
+
+    def _append_evidence_record(self, record: Dict[str, Any]) -> None:
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.ledger_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+    def _sha256_file(self, file_path: Optional[str]) -> Optional[str]:
+        if not file_path:
+            return None
+        path = Path(file_path)
+        if not path.exists() or not path.is_file():
+            return None
+
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(8192), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def _load_rules(self) -> Dict[str, Any]:
         rules_file = Path(self.rules_path)
