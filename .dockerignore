@@ -1,0 +1,27 @@
+# VCS
+.git
+.gitignore
+
+# Python caches / virtualenvs
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Test and local artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+reports/
+session/
+
+# Editor / OS files
+.vscode/
+.idea/
+.DS_Store
+
+# Large / unnecessary docs for runtime image
+*.md
+LICENSE

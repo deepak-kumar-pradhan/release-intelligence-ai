@@ -11,6 +11,12 @@ from uuid import uuid4
 
 from fpdf import FPDF
 
+try:
+    from azure.storage.blob import BlobServiceClient, ContentSettings
+except ImportError:
+    BlobServiceClient = None
+    ContentSettings = None
+
 from src.agents.expert_security_agent import ExpertSecurityAgent
 from src.agents.policy_agent import PolicyAgent
 from src.mcp.mcp_client import MCPClient
@@ -60,6 +66,14 @@ class SecurityReviewWorkflow:
         self.policy_agent = policy_agent or PolicyAgent(use_llm=use_llm)
         self.rules_path = rules_path
         self.ledger_path = Path("session") / "evidence_ledger.jsonl"
+        self.strict_enterprise_approval = os.getenv("STRICT_ENTERPRISE_APPROVAL", "false").lower() == "true"
+        self.blob_connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
+        self.blob_container = os.getenv("AZURE_STORAGE_CONTAINER", "").strip()
+        self.blob_prefix = os.getenv("AZURE_STORAGE_BLOB_PREFIX", "attestations").strip("/")
+        self.blob_upload_enabled = bool(self.blob_connection_string and self.blob_container)
+        if self.blob_upload_enabled and BlobServiceClient is None:
+            print("[BLOB] Disabled: azure-storage-blob package is not installed")
+            self.blob_upload_enabled = False
 
     def execute(self) -> Dict[str, Any]:
         return self.orchestrate(services=[])
@@ -70,6 +84,9 @@ class SecurityReviewWorkflow:
         hitl_approved: bool = False,
         reviewer_name: str = "",
         reviewer_action: str = "",
+        reviewer_principal_id: str = "",
+        reviewer_role: str = "",
+        reviewer_identity_verified: bool = False,
     ) -> Dict[str, Any]:
         normalized_services = self._validate_services(services or [])
         return self.run_security_review(
@@ -77,6 +94,9 @@ class SecurityReviewWorkflow:
             hitl_approved=hitl_approved,
             reviewer_name=reviewer_name.strip(),
             reviewer_action=reviewer_action.strip(),
+            reviewer_principal_id=reviewer_principal_id.strip(),
+            reviewer_role=reviewer_role.strip(),
+            reviewer_identity_verified=bool(reviewer_identity_verified),
         )
 
     def fetch_data(self, services: Optional[List[Dict[str, str]]] = None) -> Dict[str, Dict[str, Any]]:
@@ -168,6 +188,9 @@ class SecurityReviewWorkflow:
         hitl_approved: bool = False,
         reviewer_name: str = "",
         reviewer_action: str = "",
+        reviewer_principal_id: str = "",
+        reviewer_role: str = "",
+        reviewer_identity_verified: bool = False,
     ) -> Dict[str, Any]:
         with self.tracer.start_as_current_span("workflow.run_security_review") as span:
             run_id = self._new_run_id()
@@ -179,6 +202,9 @@ class SecurityReviewWorkflow:
             reviewer_name_clean = reviewer_name.strip()
             if reviewer_action_normalized and not reviewer_name_clean:
                 raise ValueError("Reviewer name is required when manual action is provided.")
+            reviewer_principal_id_clean = reviewer_principal_id.strip()
+            reviewer_role_clean = reviewer_role.strip()
+            reviewer_identity_verified_flag = bool(reviewer_identity_verified)
 
             raw_results = self.fetch_data(services)
             summary_rows = self.aggregate_results(raw_results)
@@ -202,6 +228,31 @@ class SecurityReviewWorkflow:
 
             # If a reviewer has explicitly acted, do not pause — use their decision
             reviewer_acted = bool(reviewer_action_normalized)
+            if reviewer_acted and not reviewer_principal_id_clean:
+                reviewer_principal_id_clean = self._derive_self_asserted_principal_id(reviewer_name_clean)
+                reviewer_identity_verified_flag = False
+
+            required_reviewer_role = str(decision.get("decision_record", {}).get("approver_role_required", "")).strip()
+            if reviewer_acted and required_reviewer_role and reviewer_role_clean:
+                if reviewer_role_clean.lower() != required_reviewer_role.lower():
+                    raise ValueError(
+                        f"Reviewer role '{reviewer_role_clean}' is not allowed. Required role: {required_reviewer_role}."
+                    )
+
+            if reviewer_acted and self.strict_enterprise_approval:
+                if not reviewer_identity_verified_flag or not reviewer_principal_id_clean:
+                    raise ValueError(
+                        "Strict enterprise approval mode requires verified reviewer identity and principal ID."
+                    )
+                if not reviewer_role_clean:
+                    raise ValueError(
+                        "Strict enterprise approval mode requires reviewer role to be present."
+                    )
+                if required_reviewer_role and reviewer_role_clean.lower() != required_reviewer_role.lower():
+                    raise ValueError(
+                        f"Reviewer role '{reviewer_role_clean}' is not allowed. Required role: {required_reviewer_role}."
+                    )
+
             paused_for_hitl = requires_hitl and not hitl_approved and not reviewer_acted
 
             if reviewer_acted:
@@ -237,9 +288,24 @@ class SecurityReviewWorkflow:
             if pdf_path:
                 span.add_event("pdf.generated", {"pdf.path": pdf_path})
 
+            should_upload_blob = bool(pdf_path) and final_status == "GO"
+            blob_upload = {
+                "blob_path": None,
+                "blob_url": None,
+                "error": None,
+            }
+            if should_upload_blob:
+                blob_upload = self._upload_report_to_blob(pdf_path=pdf_path, run_id=run_id)
+                if blob_upload.get("error"):
+                    span.add_event("blob.upload_failed", {"error": str(blob_upload.get("error"))[:300]})
+                elif blob_upload.get("blob_url"):
+                    span.add_event("blob.uploaded", {"blob.url": blob_upload["blob_url"]})
+
             trace_id = current_trace_id()
             if trace_id:
                 print(f"[TRACE] workflow.run_security_review trace_id={trace_id}")
+
+            analysis_stats = self._summarize_analysis_stats(deep_dive)
 
             self._append_evidence_record(
                 {
@@ -253,10 +319,18 @@ class SecurityReviewWorkflow:
                     "policy_reason": decision.get("reason", ""),
                     "critical_count": int(decision.get("counts", {}).get("critical", 0)),
                     "high_count": int(decision.get("counts", {}).get("high", 0)),
+                    "total_findings": analysis_stats["total_findings"],
+                    "false_positive_count": analysis_stats["false_positive_count"],
                     "services": [item.get("service_name", "") for item in services],
                     "reviewer_name": reviewer_name_clean or None,
                     "reviewer_action": reviewer_action_normalized or None,
+                    "reviewer_principal_id": reviewer_principal_id_clean or None,
+                    "reviewer_role": reviewer_role_clean or None,
+                    "reviewer_identity_verified": reviewer_identity_verified_flag,
                     "report_path": pdf_path,
+                    "report_blob_path": blob_upload.get("blob_path"),
+                    "report_blob_url": blob_upload.get("blob_url"),
+                    "report_blob_error": blob_upload.get("error"),
                     "report_sha256": self._sha256_file(pdf_path),
                     "trace_id": trace_id,
                 }
@@ -271,9 +345,16 @@ class SecurityReviewWorkflow:
                 "paused_for_hitl": paused_for_hitl,
                 "status": final_status,
                 "attestation_pdf": pdf_path,
+                "attestation_blob_path": blob_upload.get("blob_path"),
+                "attestation_blob_url": blob_upload.get("blob_url"),
+                "attestation_blob_error": blob_upload.get("error"),
                 "trace_id": trace_id,
                 "reviewer_name": reviewer_name_clean or None,
                 "reviewer_action": reviewer_action_normalized or None,
+                "reviewer_principal_id": reviewer_principal_id_clean or None,
+                "reviewer_role": reviewer_role_clean or None,
+                "reviewer_identity_verified": reviewer_identity_verified_flag,
+                "analysis_stats": analysis_stats,
             }
 
     def _evaluate_governance(self, summary_rows: List[Dict[str, Any]], deep_dive: Dict[str, Any]) -> Dict[str, Any]:
@@ -291,6 +372,24 @@ class SecurityReviewWorkflow:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return f"run_{timestamp}_{uuid4().hex[:8]}"
 
+    def _summarize_analysis_stats(self, deep_dive: Dict[str, Any]) -> Dict[str, int]:
+        total_findings = 0
+        false_positive_count = 0
+        for payload in deep_dive.values():
+            analyses = payload.get("analysis", []) if isinstance(payload, dict) else []
+            total_findings += len(analyses)
+            false_positive_count += sum(
+                1 for item in analyses if bool(item.get("is_false_positive", item.get("false_positive", False)))
+            )
+        return {
+            "total_findings": total_findings,
+            "false_positive_count": false_positive_count,
+        }
+
+    def _derive_self_asserted_principal_id(self, reviewer_name: str) -> str:
+        digest = hashlib.sha256(reviewer_name.encode("utf-8")).hexdigest()[:16]
+        return f"self-asserted:{digest}"
+
     def _validate_reviewer_action(self, action: str) -> str:
         normalized = str(action or "").strip().upper()
         if not normalized:
@@ -303,8 +402,139 @@ class SecurityReviewWorkflow:
 
     def _append_evidence_record(self, record: Dict[str, Any]) -> None:
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = dict(record)
+        payload["prev_record_hash"] = self._get_last_record_hash()
+        payload["record_hash"] = self._hash_record(payload)
         with self.ledger_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+            handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+
+    def _get_last_record_hash(self) -> str:
+        if not self.ledger_path.exists():
+            return "GENESIS"
+
+        last_non_empty = ""
+        with self.ledger_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                candidate = line.strip()
+                if candidate:
+                    last_non_empty = candidate
+
+        if not last_non_empty:
+            return "GENESIS"
+
+        try:
+            parsed = json.loads(last_non_empty)
+            existing_hash = str(parsed.get("record_hash", "")).strip()
+            if existing_hash:
+                return existing_hash
+        except json.JSONDecodeError:
+            pass
+
+        return hashlib.sha256(last_non_empty.encode("utf-8")).hexdigest()
+
+    def _hash_record(self, record: Dict[str, Any]) -> str:
+        hash_source = dict(record)
+        hash_source.pop("record_hash", None)
+        payload = json.dumps(hash_source, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _upload_report_to_blob(self, pdf_path: str, run_id: str) -> Dict[str, Optional[str]]:
+        if not self.blob_upload_enabled:
+            return {"blob_path": None, "blob_url": None, "error": "Blob upload not configured."}
+
+        if BlobServiceClient is None:
+            return {"blob_path": None, "blob_url": None, "error": "azure-storage-blob package missing."}
+
+        path = Path(pdf_path)
+        if not path.exists() or not path.is_file():
+            return {"blob_path": None, "blob_url": None, "error": f"PDF file not found: {pdf_path}"}
+
+        timestamp = datetime.now().strftime("%Y/%m/%d")
+        blob_name = f"{self.blob_prefix}/{timestamp}/{run_id}_{path.name}"
+
+        try:
+            service = BlobServiceClient.from_connection_string(self.blob_connection_string)
+            container = service.get_container_client(self.blob_container)
+            try:
+                container.create_container()
+            except Exception:
+                # Container already exists or caller has no create rights; upload may still succeed.
+                pass
+
+            content_settings = None
+            if ContentSettings is not None:
+                content_settings = ContentSettings(content_type="application/pdf")
+
+            with path.open("rb") as data:
+                container.upload_blob(
+                    name=blob_name,
+                    data=data,
+                    overwrite=True,
+                    content_settings=content_settings,
+                )
+
+            blob_url = f"{container.url}/{blob_name}"
+            return {
+                "blob_path": blob_name,
+                "blob_url": blob_url,
+                "error": None,
+            }
+        except Exception as error:
+            return {
+                "blob_path": None,
+                "blob_url": None,
+                "error": str(error),
+            }
+
+    def verify_evidence_ledger(self) -> Dict[str, Any]:
+        if not self.ledger_path.exists():
+            return {
+                "valid": True,
+                "records_checked": 0,
+                "error": None,
+            }
+
+        records_checked = 0
+        expected_prev_hash = "GENESIS"
+        with self.ledger_path.open("r", encoding="utf-8") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                records_checked += 1
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    return {
+                        "valid": False,
+                        "records_checked": records_checked,
+                        "error": f"Invalid JSON at ledger line {line_number}.",
+                    }
+
+                prev_record_hash = str(record.get("prev_record_hash", ""))
+                if prev_record_hash != expected_prev_hash:
+                    return {
+                        "valid": False,
+                        "records_checked": records_checked,
+                        "error": f"Hash chain mismatch at ledger line {line_number}.",
+                    }
+
+                actual_hash = str(record.get("record_hash", ""))
+                expected_hash = self._hash_record(record)
+                if actual_hash != expected_hash:
+                    return {
+                        "valid": False,
+                        "records_checked": records_checked,
+                        "error": f"Record hash mismatch at ledger line {line_number}.",
+                    }
+
+                expected_prev_hash = actual_hash
+
+        return {
+            "valid": True,
+            "records_checked": records_checked,
+            "error": None,
+        }
 
     def _sha256_file(self, file_path: Optional[str]) -> Optional[str]:
         if not file_path:

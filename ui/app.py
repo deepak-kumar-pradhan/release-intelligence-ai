@@ -7,6 +7,11 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+try:
+    from azure.storage.blob import BlobServiceClient
+except ImportError:
+    BlobServiceClient = None
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -460,6 +465,61 @@ def _get_report_files():
     return sorted(REPORTS_DIR.glob("release_attestation_*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True)
 
 
+def _get_blob_container_client():
+    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
+    container_name = os.getenv("AZURE_STORAGE_CONTAINER", "").strip()
+    if not connection_string or not container_name or BlobServiceClient is None:
+        return None
+
+    try:
+        service = BlobServiceClient.from_connection_string(connection_string)
+        return service.get_container_client(container_name)
+    except Exception:
+        return None
+
+
+def _list_blob_reports():
+    container = _get_blob_container_client()
+    if container is None:
+        return []
+
+    prefix = os.getenv("AZURE_STORAGE_BLOB_PREFIX", "attestations").strip("/")
+    if prefix:
+        prefix = f"{prefix}/"
+
+    items = []
+    try:
+        for blob in container.list_blobs(name_starts_with=prefix or None):
+            if not str(blob.name).lower().endswith(".pdf"):
+                continue
+            items.append(
+                {
+                    "name": blob.name,
+                    "filename": Path(blob.name).name,
+                    "size": int(getattr(blob, "size", 0) or 0),
+                    "last_modified": getattr(blob, "last_modified", None),
+                    "url": f"{container.url}/{blob.name}",
+                }
+            )
+    except Exception:
+        return []
+
+    items.sort(key=lambda item: str(item.get("last_modified") or ""), reverse=True)
+    return items
+
+
+def _download_blob_report(blob_name: str):
+    container = _get_blob_container_client()
+    if container is None:
+        return None, "Blob storage is not configured in the UI runtime."
+
+    try:
+        data = container.download_blob(blob_name).readall()
+        return data, None
+    except Exception as error:
+        return None, str(error)
+
+
 def _load_evidence_records():
     if not LEDGER_PATH.exists():
         return []
@@ -531,6 +591,11 @@ def _render_report_history_page():
 
     records = _load_evidence_records()
     if records:
+        records = [item for item in records if str(item.get("report_blob_path") or "").strip()]
+        if not records:
+            st.info("No final attestation reports have been uploaded to Blob Storage yet.")
+            return
+
         all_statuses = sorted({str(item.get("status", "UNKNOWN")) for item in records})
         status_filter_col, reviewer_filter_col, service_filter_col = st.columns([1.1, 1.2, 1.2])
         with status_filter_col:
@@ -576,14 +641,23 @@ def _render_report_history_page():
 
         history_rows = []
         for item in filtered:
+            report_blob_path = str(item.get("report_blob_path") or "")
             report_path = str(item.get("report_path") or "")
-            report_name = Path(report_path).name if report_path else "N/A"
+            report_name = Path(report_blob_path).name if report_blob_path else (Path(report_path).name if report_path else "N/A")
+            reviewer_verified = bool(item.get("reviewer_identity_verified", False))
+            status_value = str(item.get("status", "N/A"))
+            reviewer_action = str(item.get("reviewer_action", "") or "").upper()
+            reviewer_name = str(item.get("reviewer_name") or "").strip()
+            reviewer_display = reviewer_name or "-"
+            if status_value.upper() == "GO" and not reviewer_name and not reviewer_action:
+                reviewer_display = "Auto-approved"
             history_rows.append(
                 {
                     "Generated": str(item.get("generated_at", "N/A")),
                     "Run ID": str(item.get("run_id", "N/A")),
-                    "Status": str(item.get("status", "N/A")),
-                    "Reviewer": str(item.get("reviewer_name") or "-"),
+                    "Status": status_value,
+                    "Reviewer": reviewer_display,
+                    "Reviewer Trust": "Verified" if reviewer_verified else "Self-asserted",
                     "Services": ", ".join(item.get("services", [])) if isinstance(item.get("services"), list) else "-",
                     "Report": report_name,
                 }
@@ -595,7 +669,7 @@ def _render_report_history_page():
         downloadable_records = [
             item
             for item in filtered
-            if str(item.get("report_path") or "") and Path(str(item.get("report_path"))).exists()
+            if str(item.get("report_blob_path") or "")
         ]
         if not downloadable_records:
             st.info("No downloadable report file found for the selected records.")
@@ -603,7 +677,9 @@ def _render_report_history_page():
 
         options = []
         for item in downloadable_records:
-            report_name = Path(str(item.get("report_path"))).name
+            report_blob_path = str(item.get("report_blob_path") or "")
+            report_path = str(item.get("report_path") or "")
+            report_name = Path(report_blob_path).name if report_blob_path else Path(report_path).name
             options.append(f"{item.get('generated_at', 'N/A')} | {item.get('status', 'N/A')} | {report_name}")
 
         selected_option = st.selectbox(
@@ -613,17 +689,56 @@ def _render_report_history_page():
             key="report_history_page_select",
         )
         selected_record = downloadable_records[options.index(selected_option)]
-        selected_path = Path(str(selected_record.get("report_path")))
-        st.download_button(
-            label="Download Selected Report",
-            data=selected_path.read_bytes(),
-            file_name=selected_path.name,
-            mime="application/pdf",
-            key="report_history_page_download",
-        )
+        selected_blob_path = str(selected_record.get("report_blob_path") or "")
+        blob_bytes, blob_error = _download_blob_report(selected_blob_path)
+        if blob_bytes is not None:
+            st.download_button(
+                label="Download Selected Report",
+                data=blob_bytes,
+                file_name=Path(selected_blob_path).name,
+                mime="application/pdf",
+                key="report_history_page_download",
+            )
+        else:
+            st.error(f"Unable to download from Blob Storage: {blob_error}")
         return
 
-    # Backward compatibility: if ledger is absent, fall back to files-only history.
+    blob_reports = _list_blob_reports()
+    if blob_reports:
+        fallback_rows = []
+        for item in blob_reports:
+            last_modified = item.get("last_modified")
+            generated = last_modified.strftime("%Y-%m-%d %H:%M:%S") if last_modified else "N/A"
+            fallback_rows.append(
+                {
+                    "Report": item["filename"],
+                    "Generated": generated,
+                    "Size": _format_file_size(item["size"]),
+                }
+            )
+        st.dataframe(pd.DataFrame.from_records(fallback_rows), use_container_width=True, hide_index=True)
+
+        selected_name = st.selectbox(
+            "Select report to download",
+            options=[item["name"] for item in blob_reports],
+            format_func=lambda name: Path(name).name,
+            index=0,
+            key="report_history_blob_only_select",
+        )
+        blob_bytes, blob_error = _download_blob_report(selected_name)
+        if blob_bytes is not None:
+            st.download_button(
+                label="Download Selected Report",
+                data=blob_bytes,
+                file_name=Path(selected_name).name,
+                mime="application/pdf",
+                key="report_history_blob_only_download",
+            )
+        else:
+            st.error(f"Unable to download from Blob Storage: {blob_error}")
+        return
+
+    # Backward compatibility: if blob and ledger are absent, fall back to local files only.
     report_files = _get_report_files()
     if not report_files:
         st.info("No previous attestation reports found yet.")
@@ -671,6 +786,19 @@ def _load_manifest():
         return {"services": [], "session": "default"}
 
     return payload
+
+
+def _get_authenticated_reviewer_context():
+    reviewer_name = (os.getenv("REVIEWER_DISPLAY_NAME") or os.getenv("REVIEWER_NAME") or "").strip()
+    reviewer_principal_id = os.getenv("REVIEWER_PRINCIPAL_ID", "").strip()
+    reviewer_role = os.getenv("REVIEWER_ROLE", "").strip()
+    identity_verified = bool(reviewer_name and reviewer_principal_id and reviewer_role)
+    return {
+        "reviewer_name": reviewer_name,
+        "reviewer_principal_id": reviewer_principal_id,
+        "reviewer_role": reviewer_role,
+        "identity_verified": identity_verified,
+    }
 
 
 def _render_service_inputs():
@@ -821,7 +949,24 @@ def _render_workflow_controls():
             unsafe_allow_html=True,
         )
 
-        reviewer_name = st.text_input("Reviewer Name", placeholder="e.g. Jane Smith")
+        reviewer_context = _get_authenticated_reviewer_context()
+        if reviewer_context["identity_verified"]:
+            st.markdown(
+                '<div class="ri-card"><b>Reviewer Identity:</b> Verified context '
+                + f"| <b>Name:</b> {reviewer_context['reviewer_name']}"
+                + f" | <b>Role:</b> {reviewer_context['reviewer_role']}</div>",
+                unsafe_allow_html=True,
+            )
+            reviewer_name = reviewer_context["reviewer_name"]
+            reviewer_principal_id = reviewer_context["reviewer_principal_id"]
+            reviewer_role = reviewer_context["reviewer_role"]
+            reviewer_identity_verified = True
+        else:
+            reviewer_name = st.text_input("Reviewer Name", placeholder="e.g. Jane Smith")
+            reviewer_principal_id = ""
+            reviewer_role = ""
+            reviewer_identity_verified = False
+            st.caption("Set REVIEWER_DISPLAY_NAME, REVIEWER_PRINCIPAL_ID, and REVIEWER_ROLE for verified reviewer approvals.")
         col_approve, col_reject = st.columns(2)
 
         with col_approve:
@@ -835,6 +980,9 @@ def _render_workflow_controls():
                             hitl_approved=True,
                             reviewer_name=reviewer_name,
                             reviewer_action="APPROVED",
+                            reviewer_principal_id=reviewer_principal_id,
+                            reviewer_role=reviewer_role,
+                            reviewer_identity_verified=reviewer_identity_verified,
                         )
                         st.session_state.workflow_result = final
                         st.rerun()
@@ -852,6 +1000,9 @@ def _render_workflow_controls():
                             hitl_approved=False,
                             reviewer_name=reviewer_name,
                             reviewer_action="REJECTED",
+                            reviewer_principal_id=reviewer_principal_id,
+                            reviewer_role=reviewer_role,
+                            reviewer_identity_verified=reviewer_identity_verified,
                         )
                         st.session_state.workflow_result = final
                         st.rerun()
@@ -868,6 +1019,14 @@ def _render_workflow_controls():
             file_name=pdf_file.name,
             mime="application/pdf",
         )
+
+    blob_url = result.get("attestation_blob_url")
+    blob_error = result.get("attestation_blob_error")
+    if blob_url:
+        st.success("Final report uploaded to Azure Blob Storage.")
+        st.code(blob_url)
+    elif blob_error:
+        st.warning(f"Blob upload not completed: {blob_error}")
 
 def main():
     if "session_id" not in st.session_state:

@@ -82,6 +82,31 @@ export CHECKMARX_URL="https://your-checkmarx-instance.com"
 export MCP_API_KEY="your-api-key-for-tools"
 ```
 
+#### Azure Blob Storage (for final approved PDFs)
+Approved final attestation PDFs can be uploaded automatically to Blob Storage.
+
+```bash
+export AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=..."
+export AZURE_STORAGE_CONTAINER="attestation-reports"
+export AZURE_STORAGE_BLOB_PREFIX="attestations"
+```
+
+#### Optional Reviewer Identity Context (for verified HITL approvals)
+When set, manual approvals in the UI are stamped as verified reviewer actions.
+
+```bash
+export REVIEWER_DISPLAY_NAME="Security Lead User"
+export REVIEWER_PRINCIPAL_ID="aad-object-id-or-upn"
+export REVIEWER_ROLE="Security_Lead"
+```
+
+#### Optional Strict Enterprise Approval Mode
+When enabled, manual approval/rejection is allowed only for verified reviewer identities.
+
+```bash
+export STRICT_ENTERPRISE_APPROVAL="true"
+```
+
 *Note: If these are not set, the system defaults to mock data for development.*
 
 #### Deploy to Azure AI Foundry (Microsoft Foundry)
@@ -97,7 +122,7 @@ To show Microsoft-native reasoning traces during your walkthrough, configure App
 1. Create or reuse an Application Insights resource in Azure.
 2. Copy its connection string into `APPLICATIONINSIGHTS_CONNECTION_STRING`.
 3. Rebuild and run the app.
-4. Run a security review and copy the `trace_id` shown in the UI.
+4. Run a security review and read the `trace_id` from application logs or `session/evidence_ledger.jsonl`.
 5. In Azure Portal, open Application Insights -> Transaction Search or Logs and filter by that trace ID.
 
 You will see spans such as:
@@ -117,6 +142,12 @@ This is the strongest Microsoft demo path because it combines Azure AI Foundry m
 streamlit run ui/app.py --server.headless true --server.port 8503
 ```
 Then open http://localhost:8503 in your browser.
+
+In the UI you can:
+- run the standard staged workflow (`Home`)
+- open the dedicated `Report History` page
+- trigger `Run Judge Demo` for a consistent panel walkthrough
+- run a ledger integrity check from the history page
 
 ### CLI Mode
 ```bash
@@ -147,6 +178,13 @@ python demo.py
 
 For live demo with real tools, set the environment variables above and run the same script.
 
+### Judge Demo Flow
+For a panel-friendly walkthrough:
+1. Open the app and click `Run Judge Demo`.
+2. Review the generated NO-GO or pending-review result.
+3. Open `Report History` to inspect audit metadata.
+4. Click `Run Integrity Check` to prove the evidence ledger hash chain is intact.
+
 ## Key Features
 
 ### 🔍 Expert Security Agent
@@ -165,11 +203,26 @@ For live demo with real tools, set the environment variables above and run the s
 - **Pause Mechanism**: Workflow halts when `requires_approval=true`
 - **Resume Control**: Security Lead approves/rejects via UI or API
 - **Audit Trail**: All decisions logged in attestation PDF
+- **Identity Context**: Optional verified reviewer identity (name, principal, role) can be injected via environment variables
 
 ### 📄 PDF Attestation Reports
 - **Styled Layout**: Blue headers, KPI cards, summary tables, vulnerability charts
 - **Policy Decision Box**: Shows final decision, violations, required approver role
 - **Deep-Dive Sections**: Per-service analysis with finding details and remediation steps
+- **Manual Decision Stamp**: Final approval/rejection includes reviewer and timestamp
+- **Azure Upload**: Approved final PDFs are uploaded to Azure Blob Storage when configured
+
+### 🧾 Evidence Ledger
+- **Append-Only Journal**: Run metadata recorded in `session/evidence_ledger.jsonl`
+- **Hash Chaining**: Each record includes `prev_record_hash` and `record_hash` for tamper-evident auditing
+- **Forensics Fields**: Includes `run_id`, status, reviewer context, local report path, blob path/url, report SHA256, and trace ID
+- **Integrity Verification**: UI can validate the full ledger chain and report pass/fail
+
+### 📈 Business Impact Dashboard
+- **Runs Recorded**: Total execution history shown on the home page
+- **Critical Risk Blocked**: Aggregate count of critical findings stopped by the workflow
+- **False Positives Filtered**: Aggregate AI triage reduction metric
+- **Manual Decisions**: Count of human approvals and rejections for governance storytelling
 
 ### 🧠 XML-Tagged Instruction Engineering
 - **2026 Microsoft Agent Framework**: System prompts structured with XML tags
