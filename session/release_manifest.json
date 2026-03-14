@@ -7,6 +7,10 @@
     {
       "service_name": "Service B",
       "release_version": "release/2.1"
+    },
+    {
+      "service_name": "Service 3",
+      "release_version": "release/2.1"
     }
   ],
   "session": "current-session"

@@ -386,6 +386,17 @@ class SecurityReviewWorkflow:
         self._draw_summary_chart(pdf, summary_rows, content_width)
 
         for service_name, details in deep_dive.items():
+            analyses = details.get("analysis", [])
+            failing_analyses = [
+                item
+                for item in analyses
+                if not bool(item.get("is_false_positive", item.get("false_positive", False)))
+            ]
+
+            # Skip clean services to avoid empty "No findings" pages in the report.
+            if not failing_analyses:
+                continue
+
             pdf.add_page()
             pdf.set_fill_color(240, 247, 255)
             pdf.rect(0, 0, pdf.w, 18, style="F")
@@ -395,13 +406,8 @@ class SecurityReviewWorkflow:
             pdf.cell(content_width, 8, f"Deep Dive - {service_name}", new_x="LMARGIN", new_y="NEXT")
             pdf.set_font("Helvetica", size=10)
             pdf.set_y(22)
-            analyses = details.get("analysis", [])
-            if not analyses:
-                pdf.set_x(pdf.l_margin)
-                pdf.cell(content_width, 7, "No findings.", new_x="LMARGIN", new_y="NEXT")
-                continue
 
-            for item in analyses:
+            for item in failing_analyses:
                 if pdf.get_y() > pdf.h - 55:
                     pdf.add_page()
                     pdf.set_y(20)
