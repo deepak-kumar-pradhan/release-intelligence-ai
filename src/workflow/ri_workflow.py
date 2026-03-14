@@ -288,7 +288,8 @@ class SecurityReviewWorkflow:
             if pdf_path:
                 span.add_event("pdf.generated", {"pdf.path": pdf_path})
 
-            should_upload_blob = bool(pdf_path) and final_status == "GO"
+            # Upload finalized attestations for both approved and explicitly rejected outcomes.
+            should_upload_blob = bool(pdf_path) and final_status in {"GO", "REJECTED"}
             blob_upload = {
                 "blob_path": None,
                 "blob_url": None,

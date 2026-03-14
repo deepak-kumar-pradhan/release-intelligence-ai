@@ -1,6 +1,10 @@
 import json
 import os
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
+
+import requests
 
 from src.observability import get_tracer
 
@@ -16,9 +20,34 @@ class PolicyAgent:
         self.model = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
         self.max_response_tokens = self._coerce_int(os.getenv("POLICY_LLM_MAX_RESPONSE_TOKENS", "180"), default=180)
         self.llm_only_amber = os.getenv("POLICY_LLM_ONLY_AMBER", "true").lower() == "true"
+        self.policy_foundry_only = os.getenv("POLICY_FOUNDRY_ONLY", "false").lower() == "true"
+        self.foundry_responses_endpoint = os.getenv("FOUNDRY_POLICY_RESPONSES_ENDPOINT", "").strip()
+        self.foundry_activity_endpoint = os.getenv("FOUNDRY_POLICY_ACTIVITY_ENDPOINT", "").strip()
+        foundry_key = os.getenv("FOUNDRY_API_KEY", "").strip()
+        azure_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
+        foundry_key_valid = bool(foundry_key and not self._is_placeholder_secret(foundry_key))
+        azure_key_valid = bool(azure_key and not self._is_placeholder_secret(azure_key))
+        self.foundry_api_key = foundry_key if foundry_key_valid else azure_key
+        self.foundry_enabled = bool(
+            self.foundry_responses_endpoint
+            and self.foundry_api_key
+            and not self._is_placeholder_secret(self.foundry_api_key)
+        )
         self.tracer = get_tracer("release_intelligence.policy_agent")
-        self.client = self._build_client() if use_llm else None
-        if not use_llm:
+        self.client = self._build_client() if (use_llm and not self.policy_foundry_only) else None
+        if self.foundry_enabled:
+            print(
+                f"[LLM][PolicyAgent] Foundry responses enabled endpoint={self.foundry_responses_endpoint}"
+            )
+            if self.foundry_activity_endpoint:
+                print(
+                    f"[LLM][PolicyAgent] Foundry activity trace endpoint enabled endpoint={self.foundry_activity_endpoint}"
+                )
+        if self.policy_foundry_only:
+            print("[LLM][PolicyAgent] Local OpenAI SDK path disabled (POLICY_FOUNDRY_ONLY=true)")
+        elif self.foundry_responses_endpoint and not (foundry_key_valid or azure_key_valid):
+            print("[LLM][PolicyAgent] Foundry endpoint set, but API key is missing or placeholder")
+        elif not use_llm:
             print("[LLM][PolicyAgent] Disabled: missing AZURE_OPENAI_ENDPOINT/API_KEY")
 
     def _build_client(self):
@@ -60,8 +89,9 @@ class PolicyAgent:
             final_decision = str(decision_record.get("final_decision", "FAIL")).upper()
             span.set_attribute("policy.final_decision", final_decision)
             span.set_attribute("policy.llm_only_amber", self.llm_only_amber)
+            span.set_attribute("policy.foundry_only", self.policy_foundry_only)
 
-            if not self.client:
+            if not self.client and not self.foundry_enabled:
                 span.add_event("policy.deterministic_only")
                 print("[LLM][PolicyAgent] Using deterministic policy path")
                 return deterministic
@@ -108,6 +138,13 @@ class PolicyAgent:
             )
             span.set_attribute("llm.prompt_preview", user_prompt[:400])
 
+            if self.foundry_enabled:
+                self._emit_foundry_activity_trace(user_prompt, span)
+                return self._llm_evaluate_via_foundry(summary_rows, user_prompt, span)
+
+            if not self.client:
+                raise ValueError("No LLM client configured for policy evaluation")
+
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
@@ -152,6 +189,162 @@ class PolicyAgent:
             print("[LLM][PolicyAgent] Governance response parsed successfully")
 
             return self._normalize_decision(result, summary_rows)
+
+    def _llm_evaluate_via_foundry(self, summary_rows: List[Dict[str, Any]], user_prompt: str, span) -> Dict[str, Any]:
+        headers = {
+            "Content-Type": "application/json",
+            "api-key": self.foundry_api_key,
+        }
+        body = {
+            "input": [
+                {
+                    "type": "message",
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "You are a release policy evaluator. Return JSON only using output_contract.",
+                        }
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": user_prompt,
+                        }
+                    ],
+                },
+            ]
+        }
+
+        response = requests.post(
+            self.foundry_responses_endpoint,
+            headers=headers,
+            json=body,
+            timeout=45,
+        )
+        if not response.ok:
+            error_excerpt = (response.text or "").strip().replace("\n", " ")[:800]
+            span.set_attribute("llm.response_status", response.status_code)
+            span.set_attribute("llm.error_excerpt", error_excerpt[:300])
+            print(
+                "[LLM][PolicyAgent] Foundry responses call failed "
+                f"status={response.status_code} body={error_excerpt or 'empty'}"
+            )
+            raise ValueError(
+                "Foundry responses call failed "
+                f"status={response.status_code} body={error_excerpt or 'empty'}"
+            )
+
+        payload = response.json()
+        content = self._extract_foundry_text(payload)
+
+        usage = payload.get("usage", {}) if isinstance(payload, dict) else {}
+        span.set_attribute("llm.provider", "azure_ai_foundry_responses")
+        span.set_attribute("llm.response_status", response.status_code)
+        span.set_attribute("policy.response_bytes", len(content))
+        if usage:
+            span.set_attribute("llm.prompt_tokens", int(usage.get("input_tokens", 0)))
+            span.set_attribute("llm.completion_tokens", int(usage.get("output_tokens", 0)))
+            span.set_attribute("llm.total_tokens", int(usage.get("total_tokens", 0)))
+
+        cleaned = content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        try:
+            result = json.loads(cleaned)
+        except json.JSONDecodeError as error:
+            raise ValueError("Foundry policy response was not valid JSON") from error
+
+        violations = result.get("policy_violations", [])
+        span.set_attribute("policy.final_decision", str(result.get("final_decision", "")))
+        span.set_attribute("policy.violations_count", len(violations))
+        span.set_attribute("policy.violations", "; ".join(violations[:5])[:300])
+        span.set_attribute("policy.requires_approval", bool(result.get("requires_approval", False)))
+        span.set_attribute("policy.approver_role", str(result.get("approver_role_required", ""))[:80])
+        print("[LLM][PolicyAgent] Governance response parsed successfully (Foundry)")
+
+        return self._normalize_decision(result, summary_rows)
+
+    def _extract_foundry_text(self, response_payload: Dict[str, Any]) -> str:
+        if not isinstance(response_payload, dict):
+            return "{}"
+
+        output_text = response_payload.get("output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text
+
+        output = response_payload.get("output", [])
+        if isinstance(output, list):
+            parts: List[str] = []
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                content = item.get("content", [])
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    text_value = block.get("text") or block.get("output_text") or block.get("value")
+                    if isinstance(text_value, str) and text_value.strip():
+                        parts.append(text_value)
+            if parts:
+                return "\n".join(parts)
+
+        return "{}"
+
+    def _emit_foundry_activity_trace(self, user_prompt: str, span) -> None:
+        if not self.foundry_activity_endpoint:
+            return
+
+        headers = {
+            "Content-Type": "application/json",
+            "api-key": self.foundry_api_key,
+        }
+        activity_payload = {
+            "type": "message",
+            "id": str(uuid4()),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "serviceUrl": "https://ri-hackathon-resource.services.ai.azure.com",
+            "channelId": "release-intelligence",
+            "from": {"id": "release-intelligence-app", "name": "Release Intelligence"},
+            "conversation": {"id": str(uuid4())},
+            "recipient": {"id": "policy-governance-agent"},
+            "text": user_prompt,
+        }
+
+        try:
+            response = requests.post(
+                self.foundry_activity_endpoint,
+                headers=headers,
+                json=activity_payload,
+                timeout=20,
+            )
+            span.set_attribute("llm.activity_status", response.status_code)
+            if response.status_code in (200, 201, 202):
+                print(
+                    "[LLM][PolicyAgent] Foundry activity trace emitted "
+                    f"status={response.status_code}"
+                )
+                return
+
+            error_excerpt = (response.text or "").strip().replace("\n", " ")[:400]
+            span.add_event(
+                "policy.activity_emit_failed",
+                {
+                    "status": response.status_code,
+                    "error": error_excerpt,
+                },
+            )
+            print(
+                "[LLM][PolicyAgent] Foundry activity trace failed "
+                f"status={response.status_code} body={error_excerpt or 'empty'}"
+            )
+        except Exception as error:
+            span.add_event("policy.activity_emit_error", {"error": str(error)[:300]})
+            print(f"[LLM][PolicyAgent] Foundry activity trace error: {error}")
 
     def _compact_summary(self, summary_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         compact_rows = []

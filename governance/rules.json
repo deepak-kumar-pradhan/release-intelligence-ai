@@ -1,7 +1,0 @@
-{
-  "block_on_critical": true,
-  "max_high_for_auto_go": 2,
-  "max_total_high_and_critical_for_auto_go": 3,
-  "sonar_fail_statuses": ["ERROR", "FAILED"],
-  "default_decision": "GO"
-}

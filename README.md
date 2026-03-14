@@ -8,7 +8,7 @@ The Release Intelligence (RI) system is an **AI-powered security review and atte
 - 📋 **Policy Governance**: Sovereign policy agent enforces ISO-27001-Agentic-Baseline rules
 - 🤝 **HITL Workflow**: Pauses for Security Lead approval when policy violations detected
 - 📄 **PDF Attestation**: Generates styled reports with KPIs, charts, and policy decisions
-- 🧠 **Instruction Engineering**: XML-tagged system prompts for advanced 2026 reasoning patterns
+- 🧠 **Cloud Agent Runtime**: Expert and Policy agents run via Azure AI Foundry endpoints with traceable execution
 
 ## Directory Structure
 ```
@@ -18,24 +18,16 @@ release-intelligence-ri/
 ├── src/
 │   ├── main.py                         # CLI entry point
 │   ├── agents/
-│   │   ├── agent_instructions.py       # XML-tagged system prompts
 │   │   ├── expert_security_agent.py    # Risk triage with toxic combo detection
 │   │   ├── policy_agent.py             # Governance decision engine
-│   │   ├── risk_analysis_agent.py      # Legacy agent placeholder
-│   │   ├── release_notes_agent.py      # Legacy agent placeholder
-│   │   └── dependency_impact_agent.py  # Legacy agent placeholder
 │   ├── workflow/
 │   │   └── ri_workflow.py              # Core orchestration + PDF generation
 │   ├── mcp/
 │   │   ├── mcp_client.py               # MCP protocol client
 │   │   └── mock_mcp_servers.py         # Mock SonarQube/Checkmarx data
-│   └── models/
-│       └── release_context.py          # Data models
 ├── governance/
 │   ├── policy.json                     # 2026.1 policy rules (active)
-│   └── rules.json                      # Legacy rules
 ├── tests/
-│   ├── test_agents.py
 │   └── test_workflow.py
 ├── reports/                            # Generated PDF attestations
 ├── session/                            # Runtime session data
@@ -175,20 +167,12 @@ print(f"Status: {result['status']}")
 print(f"PDF: {result['attestation_pdf']}")
 ```
 
-### Demo Script
-Run a quick demo with mock data:
-```bash
-python demo.py
-```
-
-For live demo with real tools, set the environment variables above and run the same script.
-
 ### End-to-End Workflow
 1. In `Home`, configure services and click `Next`.
 2. Run `Stage 2: Run Review`.
 3. If vulnerabilities require HITL, reviewer approves/rejects.
 4. Final attestation PDF is generated.
-5. For `GO` outcomes, final PDF is uploaded to Azure Blob Storage.
+5. For finalized `GO` or `REJECTED` outcomes, the final PDF is uploaded to Azure Blob Storage.
 6. Open `Report History` to view and download final blob-backed reports.
 
 ## Key Features
@@ -216,7 +200,7 @@ For live demo with real tools, set the environment variables above and run the s
 - **Policy Decision Box**: Shows final decision, violations, required approver role
 - **Deep-Dive Sections**: Per-service analysis with finding details and remediation steps
 - **Manual Decision Stamp**: Final approval/rejection includes reviewer and timestamp
-- **Azure Upload**: Final `GO` attestation PDFs are uploaded to Azure Blob Storage when configured
+- **Azure Upload**: Final `GO` and `REJECTED` attestation PDFs are uploaded to Azure Blob Storage when configured
 
 ### 🧾 Evidence Ledger
 - **Append-Only Journal**: Run metadata recorded in `session/evidence_ledger.jsonl`
@@ -224,11 +208,10 @@ For live demo with real tools, set the environment variables above and run the s
 - **Forensics Fields**: Includes `run_id`, status, reviewer context, local report path, blob path/url, report SHA256, and trace ID
 - **Integrity Verification**: Ledger chain can be verified programmatically via workflow APIs
 
-### 🧠 XML-Tagged Instruction Engineering
-- **2026 Microsoft Agent Framework**: System prompts structured with XML tags
-- **Role Definition**: `<role>`, `<task_logic>`, `<response_format>` sections
-- **Governance Rules**: Embedded directly in Policy Agent prompt
-- **HITL Protocol**: Explicit instructions for AMBER status handling
+### 🧠 Cloud-Managed Agent Instructions
+- **Foundry-Managed Behavior**: Primary Expert and Policy instructions are maintained in Azure AI Foundry agent configs
+- **Versioned Agent Apps**: App calls pinned agent versions through Foundry endpoints
+- **Operational Flexibility**: Local fallback can be re-enabled via environment toggles when needed
 
 ## Testing
 
