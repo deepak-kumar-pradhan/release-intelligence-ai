@@ -137,7 +137,14 @@ This is the strongest Microsoft demo path because it combines Azure AI Foundry m
 
 ## Running the Application
 
-### Streamlit UI (Recommended)
+### Docker Compose (Recommended)
+```bash
+docker compose build
+docker compose up -d
+```
+Then open http://localhost:8503 in your browser.
+
+### Streamlit UI (Local Development)
 ```bash
 streamlit run ui/app.py --server.headless true --server.port 8503
 ```
@@ -145,9 +152,7 @@ Then open http://localhost:8503 in your browser.
 
 In the UI you can:
 - run the standard staged workflow (`Home`)
-- open the dedicated `Report History` page
-- trigger `Run Judge Demo` for a consistent panel walkthrough
-- run a ledger integrity check from the history page
+- open the dedicated `Report History` page (final blob-backed attestations)
 
 ### CLI Mode
 ```bash
@@ -178,12 +183,13 @@ python demo.py
 
 For live demo with real tools, set the environment variables above and run the same script.
 
-### Judge Demo Flow
-For a panel-friendly walkthrough:
-1. Open the app and click `Run Judge Demo`.
-2. Review the generated NO-GO or pending-review result.
-3. Open `Report History` to inspect audit metadata.
-4. Click `Run Integrity Check` to prove the evidence ledger hash chain is intact.
+### End-to-End Workflow
+1. In `Home`, configure services and click `Next`.
+2. Run `Stage 2: Run Review`.
+3. If vulnerabilities require HITL, reviewer approves/rejects.
+4. Final attestation PDF is generated.
+5. For `GO` outcomes, final PDF is uploaded to Azure Blob Storage.
+6. Open `Report History` to view and download final blob-backed reports.
 
 ## Key Features
 
@@ -210,19 +216,13 @@ For a panel-friendly walkthrough:
 - **Policy Decision Box**: Shows final decision, violations, required approver role
 - **Deep-Dive Sections**: Per-service analysis with finding details and remediation steps
 - **Manual Decision Stamp**: Final approval/rejection includes reviewer and timestamp
-- **Azure Upload**: Approved final PDFs are uploaded to Azure Blob Storage when configured
+- **Azure Upload**: Final `GO` attestation PDFs are uploaded to Azure Blob Storage when configured
 
 ### 🧾 Evidence Ledger
 - **Append-Only Journal**: Run metadata recorded in `session/evidence_ledger.jsonl`
 - **Hash Chaining**: Each record includes `prev_record_hash` and `record_hash` for tamper-evident auditing
 - **Forensics Fields**: Includes `run_id`, status, reviewer context, local report path, blob path/url, report SHA256, and trace ID
-- **Integrity Verification**: UI can validate the full ledger chain and report pass/fail
-
-### 📈 Business Impact Dashboard
-- **Runs Recorded**: Total execution history shown on the home page
-- **Critical Risk Blocked**: Aggregate count of critical findings stopped by the workflow
-- **False Positives Filtered**: Aggregate AI triage reduction metric
-- **Manual Decisions**: Count of human approvals and rejections for governance storytelling
+- **Integrity Verification**: Ledger chain can be verified programmatically via workflow APIs
 
 ### 🧠 XML-Tagged Instruction Engineering
 - **2026 Microsoft Agent Framework**: System prompts structured with XML tags
@@ -287,26 +287,32 @@ Service B triggers:
 3. **Policy Evaluation**: Policy agent applies governance rules, generates DecisionRecord
 4. **HITL Gate**: Pauses if approval required, resumes on Security Lead action
 5. **Attestation**: Generates PDF with summary, charts, policy decision, deep-dive sections
+6. **Blob Upload**: Uploads final `GO` PDF to Azure Blob Storage
+7. **History**: Report History page lists final blob-backed reports
+
+### End-to-End Flow Diagram
+```text
+Stage 1: Release Manifest
+  -> Stage 2: Run Review
+    -> MCP Fetch (Sonar + Checkmarx)
+      -> Expert Security Analysis
+        -> Policy Evaluation
+          -> PASS/GO
+            -> Generate Final PDF
+            -> Upload GO PDF to Azure Blob Storage
+            -> Write Evidence Ledger Record
+            -> Report History Page (Final Blob-backed Reports)
+          -> FAIL/AMBER
+            -> HITL Review Required
+              -> Approved -> Generate Final PDF -> Upload GO PDF -> Ledger -> Report History
+              -> Rejected -> Generate Rejected Final PDF -> Ledger -> Report History
+```
 
 ### Agent Communication
 - **Stateless**: Each orchestration run is independent
 - **Retry Logic**: Built-in resilience for API failures
 - **Failover**: Deterministic fallback if Azure OpenAI unavailable
 
-## Troubleshooting
-
-**Port 8502 already in use**
-```bash
-streamlit run ui/app.py --server.port 8503
-```
-
-**Azure OpenAI timeout**
-- System automatically falls back to deterministic analysis
-- Check `AZURE_OPENAI_ENDPOINT` and `AZURE_OPENAI_API_KEY` if AI analysis desired
-
-**PDF not generating**
-- Ensure `reports/` directory exists (auto-created)
-- Check file permissions
 
 ## Contributing
 Contributions are welcome! Please submit a pull request or open an issue for enhancements or bug fixes.
