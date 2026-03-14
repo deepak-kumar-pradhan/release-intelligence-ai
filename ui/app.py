@@ -3,6 +3,7 @@ import os
 import sys
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +15,405 @@ from src.workflow.ri_workflow import SecurityReviewWorkflow
 
 SESSION_DIR = ROOT / "session"
 MANIFEST_PATH = SESSION_DIR / "release_manifest.json"
+
+
+def _inject_ui_theme():
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap');
+
+        :root {
+            --ri-bg: #f3f6f9;
+            --ri-panel: #ffffff;
+            --ri-text: #1e2430;
+            --ri-muted: #5f6b7a;
+            --ri-accent: #0f7b8f;
+            --ri-accent-2: #1462a6;
+            --ri-pass: #1f8f4f;
+            --ri-fail: #b64040;
+            --ri-amber: #b27a14;
+            --ri-border: #dce4ec;
+        }
+
+        html, body, [class*="css"] {
+            font-family: 'Space Grotesk', sans-serif;
+        }
+
+        .stApp {
+            background:
+                radial-gradient(1200px 500px at 85% -100px, rgba(20, 98, 166, 0.16), transparent 60%),
+                radial-gradient(900px 400px at -5% 5%, rgba(15, 123, 143, 0.13), transparent 55%),
+                var(--ri-bg);
+            color: var(--ri-text);
+        }
+
+        .block-container {
+            padding-top: 2rem;
+            padding-bottom: 2rem;
+        }
+
+        .ri-hero {
+            border: 1px solid var(--ri-border);
+            border-radius: 16px;
+            background: linear-gradient(120deg, #0f3f67 0%, #13658a 52%, #1a7fa1 100%);
+            padding: 1.35rem 1.4rem;
+            margin-bottom: 1rem;
+            animation: riseIn 420ms ease-out;
+            box-shadow: 0 12px 28px rgba(13, 47, 76, 0.22);
+            color: #ffffff;
+        }
+
+        .ri-subtle {
+            color: var(--ri-muted);
+            font-size: 0.95rem;
+        }
+
+        .ri-hero .ri-subtle {
+            color: rgba(255, 255, 255, 0.88);
+            font-size: 1rem;
+            text-align: left;
+            max-width: 780px;
+        }
+
+        .ri-hero h1 {
+            color: #ffffff;
+            letter-spacing: 0.01em;
+            text-align: left;
+        }
+
+        .ri-meta {
+            margin-top: 0.4rem;
+            color: #163f57;
+            font-size: 0.88rem;
+            background: rgba(15, 123, 143, 0.10);
+            border: 1px solid rgba(15, 123, 143, 0.28);
+            border-radius: 999px;
+            padding: 0.3rem 0.7rem;
+            display: inline-block;
+        }
+
+        .ri-card {
+            border: 1px solid var(--ri-border);
+            border-radius: 14px;
+            background: var(--ri-panel);
+            padding: 0.9rem 1rem;
+            margin: 0.5rem 0 0.8rem 0;
+            box-shadow: 0 5px 16px rgba(18, 32, 48, 0.05);
+        }
+
+        .ri-kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 0.7rem;
+            margin: 0.35rem 0 1rem;
+        }
+
+        .ri-kpi {
+            border: 1px solid var(--ri-border);
+            border-radius: 12px;
+            background: linear-gradient(180deg, #ffffff, #f7fbff);
+            padding: 0.72rem 0.8rem;
+            box-shadow: 0 6px 14px rgba(18, 32, 48, 0.04);
+            text-align: left;
+        }
+
+        .ri-kpi-k {
+            color: #667589;
+            font-size: 0.79rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            margin-bottom: 0.2rem;
+        }
+
+        .ri-kpi-v {
+            font-size: 1.15rem;
+            font-weight: 700;
+            line-height: 1.2;
+            color: #1f2a36;
+        }
+
+        .ri-kpi-risk {
+            color: #b64040;
+        }
+
+        .ri-policy {
+            border: 1px solid var(--ri-border);
+            border-radius: 14px;
+            background: linear-gradient(180deg, #ffffff, #f4f9ff);
+            padding: 1rem 1.1rem;
+            margin: 0.55rem 0 0.9rem;
+            box-shadow: 0 8px 22px rgba(12, 29, 45, 0.06);
+        }
+
+        .ri-policy-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 0.75rem;
+            margin-top: 0.35rem;
+        }
+
+        .ri-policy-tile {
+            border: 1px solid #dbe5ee;
+            border-radius: 10px;
+            background: #ffffff;
+            padding: 0.62rem 0.7rem;
+        }
+
+        .ri-policy-k {
+            color: #667589;
+            font-size: 0.82rem;
+            margin-bottom: 0.25rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+
+        .ri-policy-v {
+            font-size: 1.15rem;
+            font-weight: 700;
+            color: #1f2a36;
+            line-height: 1.2;
+            word-break: break-word;
+        }
+
+        .ri-pill {
+            display: inline-block;
+            border-radius: 999px;
+            padding: 0.22rem 0.55rem;
+            font-size: 0.84rem;
+            font-weight: 700;
+            border: 1px solid;
+        }
+
+        .ri-pill-pass {
+            color: var(--ri-pass);
+            background: #ebf8f0;
+            border-color: #b8e2c6;
+        }
+
+        .ri-pill-fail {
+            color: var(--ri-fail);
+            background: #fff0f0;
+            border-color: #efbcbc;
+        }
+
+        .ri-pill-amber {
+            color: var(--ri-amber);
+            background: #fff7e8;
+            border-color: #f1d9a9;
+        }
+
+        .ri-violations {
+            margin-top: 0.75rem;
+            color: #3d4a59;
+            font-size: 0.95rem;
+        }
+
+        .ri-status {
+            border-radius: 12px;
+            border: 1px solid;
+            padding: 0.9rem 1rem;
+            margin: 0.6rem 0 0.7rem;
+            font-weight: 600;
+            text-align: left;
+        }
+
+        h3 {
+            color: #173e59;
+            letter-spacing: 0.01em;
+        }
+
+        .ri-status-pass {
+            background: #e9f8ee;
+            border-color: #b8e2c6;
+            color: var(--ri-pass);
+        }
+
+        .ri-status-fail {
+            background: #fdeeee;
+            border-color: #efbcbc;
+            color: var(--ri-fail);
+        }
+
+        .ri-status-amber {
+            background: #fff7e8;
+            border-color: #f1d9a9;
+            color: var(--ri-amber);
+        }
+
+        div.stButton > button,
+        div.stDownloadButton > button {
+            border-radius: 11px;
+            border: 1px solid #1f6b93;
+            background: linear-gradient(135deg, #0f7b8f, #1462a6);
+            color: #ffffff;
+            font-weight: 600;
+            letter-spacing: 0.1px;
+            box-shadow: 0 8px 18px rgba(20, 98, 166, 0.25);
+            transition: transform 0.16s ease, box-shadow 0.16s ease;
+        }
+
+        div.stButton > button:hover,
+        div.stDownloadButton > button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 11px 22px rgba(20, 98, 166, 0.35);
+        }
+
+        div[data-testid="stNumberInput"] input,
+        div[data-testid="stTextInput"] input {
+            border-radius: 10px;
+            border-color: #d2deea;
+            background-color: #ffffff;
+        }
+
+        div[data-testid="stNumberInput"] label,
+        div[data-testid="stTextInput"] label {
+            font-weight: 600;
+            color: #344459;
+        }
+
+        @keyframes riseIn {
+            from { opacity: 0; transform: translateY(6px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @media (max-width: 900px) {
+            .block-container {
+                padding-top: 1.2rem;
+            }
+            .ri-hero {
+                padding: 0.9rem 1rem;
+            }
+            .ri-kpi-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+            .ri-policy-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _status_label_style(status: str) -> str:
+    status_upper = str(status or "").upper()
+    if status_upper in {"GO", "PASS"}:
+        return "ri-status ri-status-pass"
+    if status_upper in {"AMBER", "PENDING REVIEW"}:
+        return "ri-status ri-status-amber"
+    return "ri-status ri-status-fail"
+
+
+def _decision_pill_class(decision: str) -> str:
+    decision_upper = str(decision or "").upper()
+    if decision_upper == "PASS":
+        return "ri-pill ri-pill-pass"
+    if decision_upper == "AMBER":
+        return "ri-pill ri-pill-amber"
+    return "ri-pill ri-pill-fail"
+
+
+def _render_summary_table(summary_rows):
+    if not summary_rows:
+        st.info("No summary rows available.")
+        return
+
+    records = []
+    for row in summary_rows:
+        sast_c = int(row.get("checkmarx_sast", {}).get("critical", 0))
+        sast_h = int(row.get("checkmarx_sast", {}).get("high", 0))
+        sca_c = int(row.get("checkmarx_sca", {}).get("critical", 0))
+        sca_h = int(row.get("checkmarx_sca", {}).get("high", 0))
+        records.append(
+            {
+                "Service": row.get("service_name", "N/A"),
+                "Version": row.get("release_version", "N/A"),
+                "Sonar": row.get("sonar_status", "UNKNOWN"),
+                "SAST C": sast_c,
+                "SAST H": sast_h,
+                "SCA C": sca_c,
+                "SCA H": sca_h,
+                "Total": sast_c + sast_h + sca_c + sca_h,
+            }
+        )
+
+    df = pd.DataFrame.from_records(records)
+
+    def _row_background(row):
+        even = row.name % 2 == 0
+        color = "#f8fbff" if even else "#ffffff"
+        return [f"background-color: {color}"] * len(row)
+
+    def _sonar_color(value):
+        status = str(value).upper()
+        if status in {"ERROR", "FAILED"}:
+            return "color: #b64040; font-weight: 700"
+        if status in {"WARN", "WARNING"}:
+            return "color: #b27a14; font-weight: 700"
+        return "color: #1f8f4f; font-weight: 700"
+
+    def _count_color(value):
+        number = int(value)
+        if number <= 0:
+            return "color: #3f4e5f"
+        return "color: #b64040; font-weight: 700"
+
+    styled = (
+        df.style
+        .apply(_row_background, axis=1)
+        .map(_sonar_color, subset=["Sonar"])
+        .map(_count_color, subset=["SAST C", "SAST H", "SCA C", "SCA H", "Total"])
+    )
+
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
+def _compute_summary_kpis(summary_rows):
+    kpis = {
+        "services": len(summary_rows or []),
+        "critical": 0,
+        "high": 0,
+        "failing_sonar": 0,
+    }
+    for row in summary_rows or []:
+        sast = row.get("checkmarx_sast", {})
+        sca = row.get("checkmarx_sca", {})
+        kpis["critical"] += int(sast.get("critical", 0)) + int(sca.get("critical", 0))
+        kpis["high"] += int(sast.get("high", 0)) + int(sca.get("high", 0))
+        if str(row.get("sonar_status", "")).upper() in {"ERROR", "FAILED"}:
+            kpis["failing_sonar"] += 1
+    return kpis
+
+
+def _render_risk_snapshot(result):
+    kpis = _compute_summary_kpis(result.get("summary", []))
+    final_status = str(result.get("status", "NO-GO")).upper()
+    status_class = _decision_pill_class(final_status if final_status != "GO" else "PASS")
+    st.markdown(
+        f"""
+        <div class="ri-kpi-grid">
+            <div class="ri-kpi">
+                <div class="ri-kpi-k">Final Status</div>
+                <div class="ri-kpi-v"><span class="{status_class}">{final_status}</span></div>
+            </div>
+            <div class="ri-kpi">
+                <div class="ri-kpi-k">Services Assessed</div>
+                <div class="ri-kpi-v">{kpis['services']}</div>
+            </div>
+            <div class="ri-kpi">
+                <div class="ri-kpi-k">Critical Findings</div>
+                <div class="ri-kpi-v ri-kpi-risk">{kpis['critical']}</div>
+            </div>
+            <div class="ri-kpi">
+                <div class="ri-kpi-k">High Findings</div>
+                <div class="ri-kpi-v ri-kpi-risk">{kpis['high']}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _ensure_session_dir():
@@ -52,7 +452,7 @@ def _load_manifest():
 
 
 def _render_service_inputs():
-    st.subheader("Release Manifest")
+    st.subheader("Stage 1: Release Manifest")
     count = st.number_input("Number of services", min_value=1, max_value=20, value=2, step=1)
 
     services = []
@@ -69,13 +469,14 @@ def _render_service_inputs():
                 }
             )
 
-    if st.button("Save release_manifest.json"):
+    if st.button("Next"):
         saved = _save_manifest(services)
+        st.session_state.stage1_complete = len(saved.get("services", [])) > 0
         st.success(f"Saved {len(saved['services'])} services to {MANIFEST_PATH}")
 
 
 def _render_workflow_controls():
-    st.subheader("Security Review Workflow")
+    st.subheader("Stage 2: Run Review")
     manifest = _load_manifest()
     services = manifest.get("services", [])
 
@@ -83,8 +484,19 @@ def _render_workflow_controls():
         st.info("No services in manifest yet. Add services and save first.")
         return
 
-    st.write("Loaded services:")
-    st.json(services)
+    st.markdown('<div class="ri-card"><span class="ri-subtle">Loaded services from manifest</span></div>', unsafe_allow_html=True)
+    manifest_df = pd.DataFrame.from_records(
+        [
+            {
+                "Service": item.get("service_name", "N/A"),
+                "Release Version": item.get("release_version", "N/A"),
+            }
+            for item in services
+        ]
+    )
+    st.dataframe(manifest_df, use_container_width=True, hide_index=True)
+    with st.expander("View raw manifest JSON"):
+        st.json(services)
 
     if "workflow_result" not in st.session_state:
         st.session_state.workflow_result = None
@@ -103,58 +515,131 @@ def _render_workflow_controls():
     if not result:
         return
 
-    if result.get("trace_id"):
-        st.write("### Trace")
-        st.code(result["trace_id"])
+    st.write("### Risk Snapshot")
+    _render_risk_snapshot(result)
 
     st.write("### Stage 2 Aggregated Summary")
-    st.table(result["summary"])
+    _render_summary_table(result["summary"])
 
-    st.write("### Governance Status")
-    st.json(result["governance"])
+    final_status = str(result.get("status", "NO-GO")).upper()
+    is_passing = final_status == "GO"
 
-    decision_record = result.get("governance", {}).get("decision_record", {})
-    if decision_record:
-        st.write("### Policy Decision")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Final Decision", decision_record.get("final_decision", "N/A"))
-        col2.metric("Requires Approval", str(decision_record.get("requires_approval", False)))
-        col3.metric("Approver Role", decision_record.get("approver_role_required", "N/A"))
+    if not is_passing:
+        decision_record = result.get("governance", {}).get("decision_record", {})
+        if decision_record:
+            st.write("### Policy Decision")
+            final_decision = str(decision_record.get("final_decision", "N/A")).upper()
+            requires_approval = str(decision_record.get("requires_approval", False))
+            approver_role = str(decision_record.get("approver_role_required", "N/A"))
+            pill_class = _decision_pill_class(final_decision)
 
-        violations = decision_record.get("policy_violations", [])
-        if violations:
-            st.write("Policy Violations:")
-            st.write(", ".join(violations))
+            st.markdown(
+                f"""
+                <div class="ri-policy">
+                    <div class="ri-policy-grid">
+                        <div class="ri-policy-tile">
+                            <div class="ri-policy-k">Final Decision</div>
+                            <div class="ri-policy-v"><span class="{pill_class}">{final_decision}</span></div>
+                        </div>
+                        <div class="ri-policy-tile">
+                            <div class="ri-policy-k">Requires Approval</div>
+                            <div class="ri-policy-v">{requires_approval}</div>
+                        </div>
+                        <div class="ri-policy-tile">
+                            <div class="ri-policy-k">Approver Role</div>
+                            <div class="ri-policy-v">{approver_role}</div>
+                        </div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-        if decision_record.get("justification_request"):
-            st.warning(decision_record["justification_request"])
+            violations = [v for v in decision_record.get("policy_violations", []) if v != "none"]
+            if violations:
+                st.markdown(
+                    '<div class="ri-violations"><b>Policy Violations:</b> '
+                    + ", ".join(violations)
+                    + "</div>",
+                    unsafe_allow_html=True,
+                )
+
+            if decision_record.get("justification_request"):
+                st.warning(decision_record["justification_request"])
+
+    status_css = _status_label_style(final_status)
+    st.markdown(
+        f'<div class="{status_css}">Final Status: {final_status}</div>',
+        unsafe_allow_html=True,
+    )
 
     if result.get("paused_for_hitl"):
-        st.warning("Critical vulnerabilities found. Human-in-the-loop approval is required to proceed.")
-        approved = st.checkbox("I approve release after manual review", value=False)
-        if st.button("Finalize Attestation"):
-            if not approved:
-                st.error("Approval is required before final attestation.")
-            else:
-                try:
-                    final = workflow.orchestrate(services=services, hitl_approved=True)
-                    st.session_state.workflow_result = final
-                    st.success(f"Final Status: {final['status']}")
-                    if final.get("attestation_pdf"):
-                        pdf_file = Path(final["attestation_pdf"])
-                        st.download_button(
-                            label="Download Release Attestation PDF",
-                            data=pdf_file.read_bytes(),
-                            file_name=pdf_file.name,
-                            mime="application/pdf",
+        # Always show preliminary PDF so reviewer can read findings before deciding
+        if result.get("attestation_pdf"):
+            prelim_file = Path(result["attestation_pdf"])
+            st.download_button(
+                label="Download Preliminary Report (for review)",
+                data=prelim_file.read_bytes(),
+                file_name=prelim_file.name,
+                mime="application/pdf",
+            )
+
+        st.markdown(
+            """
+            <div class="ri-policy" style="border-left: 4px solid #b27a14; margin-top:1rem;">
+                <div style="font-size:1rem;font-weight:700;color:#8a5f10;margin-bottom:0.5rem;">
+                    Manual Review Required
+                </div>
+                <div class="ri-subtle">
+                    Critical findings were detected. A security reviewer must approve or reject
+                    this release before a final attestation can be generated.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        reviewer_name = st.text_input("Reviewer Name", placeholder="e.g. Jane Smith")
+        col_approve, col_reject = st.columns(2)
+
+        with col_approve:
+            if st.button("Approve Release", use_container_width=True):
+                if not reviewer_name.strip():
+                    st.error("Please enter the reviewer name before approving.")
+                else:
+                    try:
+                        final = workflow.orchestrate(
+                            services=services,
+                            hitl_approved=True,
+                            reviewer_name=reviewer_name,
+                            reviewer_action="APPROVED",
                         )
-                except ValueError as error:
-                    st.error(f"Input validation failed: {error}")
+                        st.session_state.workflow_result = final
+                        st.rerun()
+                    except ValueError as error:
+                        st.error(f"Input validation failed: {error}")
+
+        with col_reject:
+            if st.button("Reject Release", use_container_width=True):
+                if not reviewer_name.strip():
+                    st.error("Please enter the reviewer name before rejecting.")
+                else:
+                    try:
+                        final = workflow.orchestrate(
+                            services=services,
+                            hitl_approved=False,
+                            reviewer_name=reviewer_name,
+                            reviewer_action="REJECTED",
+                        )
+                        st.session_state.workflow_result = final
+                        st.rerun()
+                    except ValueError as error:
+                        st.error(f"Input validation failed: {error}")
         return
 
+    # Final attestation PDF (includes manual review stamp if reviewer info present)
     if result.get("attestation_pdf"):
         pdf_file = Path(result["attestation_pdf"])
-        st.success(f"Final Status: {result['status']}")
         st.download_button(
             label="Download Release Attestation PDF",
             data=pdf_file.read_bytes(),
@@ -167,26 +652,27 @@ def main():
     if "session_id" not in st.session_state:
         st.session_state.session_id = "current-session"
 
-    st.set_page_config(page_title="Release Intelligence", layout="wide")
-    st.title("Release Intelligence (RI) - Security Review")
-    st.caption("MCP fetch + AI analysis + HITL attestation")
+    if "stage1_complete" not in st.session_state:
+        st.session_state.stage1_complete = False
 
-    llm_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-    llm_model = os.getenv("AZURE_OPENAI_DEPLOYMENT")
-    llm_api_key = os.getenv("AZURE_OPENAI_API_KEY", "")
-    llm_enabled = bool(
-        llm_endpoint
-        and llm_api_key
-        and not llm_api_key.upper().startswith("REPLACE_WITH_")
-        and "YOUR_" not in llm_api_key.upper()
-    )
-    st.info(
-        f"LLM Runtime: {'Enabled' if llm_enabled else 'Disabled'} | Model: {llm_model or 'not set'} | Endpoint: {llm_endpoint or 'not set'}"
+    st.set_page_config(page_title="Release Intelligence", layout="wide")
+    _inject_ui_theme()
+
+    st.markdown(
+        """
+        <div class="ri-hero">
+            <h1 style="margin:0;">Release Intelligence</h1>
+            <p class="ri-subtle" style="margin:0.35rem 0 0 0;">Agentic security review and policy attestation with traceable AI decisions.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
     _render_service_inputs()
-    st.divider()
-    _render_workflow_controls()
+
+    if st.session_state.stage1_complete:
+        st.divider()
+        _render_workflow_controls()
 
 
 if __name__ == "__main__":

@@ -60,9 +60,20 @@ class SecurityReviewWorkflow:
     def execute(self) -> Dict[str, Any]:
         return self.orchestrate(services=[])
 
-    def orchestrate(self, services: Optional[List[Dict[str, str]]] = None, hitl_approved: bool = False) -> Dict[str, Any]:
+    def orchestrate(
+        self,
+        services: Optional[List[Dict[str, str]]] = None,
+        hitl_approved: bool = False,
+        reviewer_name: str = "",
+        reviewer_action: str = "",
+    ) -> Dict[str, Any]:
         normalized_services = self._validate_services(services or [])
-        return self.run_security_review(services=normalized_services, hitl_approved=hitl_approved)
+        return self.run_security_review(
+            services=normalized_services,
+            hitl_approved=hitl_approved,
+            reviewer_name=reviewer_name.strip(),
+            reviewer_action=reviewer_action.strip(),
+        )
 
     def fetch_data(self, services: Optional[List[Dict[str, str]]] = None) -> Dict[str, Dict[str, Any]]:
         if services is None:
@@ -147,7 +158,13 @@ class SecurityReviewWorkflow:
             },
         }
 
-    def run_security_review(self, services: List[Dict[str, str]], hitl_approved: bool = False) -> Dict[str, Any]:
+    def run_security_review(
+        self,
+        services: List[Dict[str, str]],
+        hitl_approved: bool = False,
+        reviewer_name: str = "",
+        reviewer_action: str = "",
+    ) -> Dict[str, Any]:
         with self.tracer.start_as_current_span("workflow.run_security_review") as span:
             span.set_attribute("services.count", len(services))
             span.set_attribute("workflow.hitl_approved", hitl_approved)
@@ -166,25 +183,48 @@ class SecurityReviewWorkflow:
 
             decision = self._evaluate_governance(summary_rows, deep_dive)
             critical_count = decision["counts"]["critical"]
+            final_decision_str = str(decision.get("decision_record", {}).get("final_decision", "FAIL")).upper()
             requires_hitl = bool(decision.get("requires_approval", False)) or critical_count > 0
-            paused_for_hitl = requires_hitl and not hitl_approved
+            # Never block a clean PASS with zero critical findings
+            if final_decision_str == "PASS" and critical_count == 0:
+                requires_hitl = False
 
-            final_status = "NO-GO" if paused_for_hitl else decision["status"]
+            # If a reviewer has explicitly acted, do not pause — use their decision
+            reviewer_acted = bool(reviewer_action.strip())
+            paused_for_hitl = requires_hitl and not hitl_approved and not reviewer_acted
+
+            if reviewer_acted:
+                final_status = "GO" if reviewer_action.upper() == "APPROVED" else "REJECTED"
+            else:
+                final_status = "NO-GO" if paused_for_hitl else decision["status"]
             span.set_attribute("workflow.final_status", final_status)
             span.set_attribute("workflow.requires_hitl", requires_hitl)
             span.set_attribute("workflow.paused_for_hitl", paused_for_hitl)
 
             pdf_path = None
-            if not paused_for_hitl:
+            if paused_for_hitl:
+                # Generate a preliminary PDF so the reviewer can read findings before deciding
+                pdf_path = self.generate_attestation_pdf(
+                    summary_rows=summary_rows,
+                    deep_dive=deep_dive,
+                    status="PENDING REVIEW",
+                    governance_reason=decision["reason"],
+                    governance_decision=decision,
+                    reviewer_name=None,
+                    reviewer_action=None,
+                )
+            else:
                 pdf_path = self.generate_attestation_pdf(
                     summary_rows=summary_rows,
                     deep_dive=deep_dive,
                     status=final_status,
                     governance_reason=decision["reason"],
                     governance_decision=decision,
+                    reviewer_name=reviewer_name or None,
+                    reviewer_action=reviewer_action or None,
                 )
-                if pdf_path:
-                    span.add_event("pdf.generated", {"pdf.path": pdf_path})
+            if pdf_path:
+                span.add_event("pdf.generated", {"pdf.path": pdf_path})
 
             trace_id = current_trace_id()
             if trace_id:
@@ -258,6 +298,8 @@ class SecurityReviewWorkflow:
         status: str,
         governance_reason: str,
         governance_decision: Optional[Dict[str, Any]] = None,
+        reviewer_name: Optional[str] = None,
+        reviewer_action: Optional[str] = None,
     ) -> str:
         output_dir = Path("reports")
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -306,7 +348,9 @@ class SecurityReviewWorkflow:
         pdf.set_text_color(255, 255, 255)
         pdf.set_font("Helvetica", "B", 12)
         pdf.set_x(pdf.l_margin)
-        pdf.cell(52, 10, f"Executive Status: {status}", border=0, fill=True, new_x="LMARGIN", new_y="NEXT")
+        status_text = f"Executive Status: {status}"
+        status_width = min(content_width, pdf.get_string_width(self._safe_pdf_text(status_text)) + 10)
+        pdf.cell(status_width, 10, status_text, border=0, fill=True, new_x="LMARGIN", new_y="NEXT")
         pdf.set_text_color(0, 0, 0)
         pdf.ln(2)
 
@@ -350,6 +394,30 @@ class SecurityReviewWorkflow:
             pdf.cell(content_width, 6, "HITL Justification Request", new_x="LMARGIN", new_y="NEXT")
             pdf.set_font("Helvetica", size=10)
             write_block(justification_request, line_height=6)
+
+        if reviewer_name and reviewer_action:
+            review_ts = datetime.now().isoformat(timespec="seconds")
+            action_upper = reviewer_action.upper()
+            if action_upper == "APPROVED":
+                rev_r, rev_g, rev_b = 31, 143, 79   # green
+            else:
+                rev_r, rev_g, rev_b = 184, 28, 53   # red
+            pdf.ln(1)
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.set_x(pdf.l_margin)
+            pdf.cell(content_width, 7, "Manual Review Decision", new_x="LMARGIN", new_y="NEXT")
+            pdf.set_fill_color(rev_r, rev_g, rev_b)
+            pdf.set_text_color(255, 255, 255)
+            box_y2 = pdf.get_y()
+            pdf.rect(pdf.l_margin, box_y2, content_width, 22, style="F")
+            pdf.set_xy(pdf.l_margin + 3, box_y2 + 3)
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.cell(content_width - 6, 7, f"Decision: Manually {action_upper}", new_x="LMARGIN", new_y="NEXT")
+            pdf.set_x(pdf.l_margin + 3)
+            pdf.set_font("Helvetica", size=10)
+            pdf.cell(content_width - 6, 5, f"Reviewer: {reviewer_name}   |   Timestamp: {review_ts}", new_x="LMARGIN", new_y="NEXT")
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_y(box_y2 + 25)
 
         pdf.ln(1)
 

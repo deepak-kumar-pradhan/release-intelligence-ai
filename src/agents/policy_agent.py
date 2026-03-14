@@ -312,6 +312,9 @@ class PolicyAgent:
             "high": sum(row["checkmarx_sast"]["high"] + row["checkmarx_sca"]["high"] for row in summary_rows),
         }
         reason = decision_record.get("reason", "Policy evaluation completed.")
+        # A clean PASS must never require approval, regardless of what the LLM may have returned
+        raw_requires = bool(decision_record.get("requires_approval", final_decision == "AMBER"))
+        requires_approval_final = raw_requires if final_decision != "PASS" else False
         return {
             "status": status,
             "reason": reason,
@@ -321,7 +324,7 @@ class PolicyAgent:
             "decision_record": {
                 "final_decision": final_decision,
                 "policy_violations": decision_record.get("policy_violations", []),
-                "requires_approval": bool(decision_record.get("requires_approval", final_decision == "AMBER")),
+                "requires_approval": requires_approval_final,
                 "approver_role_required": decision_record.get("approver_role_required", "Security_Manager"),
                 **(
                     {"justification_request": decision_record["justification_request"]}
@@ -329,5 +332,5 @@ class PolicyAgent:
                     else {}
                 ),
             },
-            "requires_approval": bool(decision_record.get("requires_approval", final_decision == "AMBER")),
+            "requires_approval": requires_approval_final,
         }
