@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -15,6 +16,7 @@ from src.workflow.ri_workflow import SecurityReviewWorkflow
 
 SESSION_DIR = ROOT / "session"
 MANIFEST_PATH = SESSION_DIR / "release_manifest.json"
+REPORTS_DIR = ROOT / "reports"
 
 
 def _inject_ui_theme():
@@ -272,6 +274,29 @@ def _inject_ui_theme():
             color: #344459;
         }
 
+        div[data-testid="stRadio"] > div {
+            background: linear-gradient(180deg, #ffffff, #f2f8ff);
+            border: 1px solid #c8d7e7;
+            border-radius: 12px;
+            padding: 0.28rem;
+            width: fit-content;
+        }
+
+        div[data-testid="stRadio"] label {
+            border-radius: 9px;
+            padding: 0.36rem 0.85rem;
+            margin-right: 0.25rem;
+            border: 1px solid transparent;
+            transition: background-color 0.15s ease, border-color 0.15s ease;
+        }
+
+        div[data-testid="stRadio"] label:has(input:checked) {
+            background: linear-gradient(135deg, #0f7b8f, #1462a6);
+            color: #ffffff;
+            border-color: #1f6b93;
+            box-shadow: 0 6px 14px rgba(20, 98, 166, 0.25);
+        }
+
         @keyframes riseIn {
             from { opacity: 0; transform: translateY(6px); }
             to { opacity: 1; transform: translateY(0); }
@@ -418,6 +443,101 @@ def _render_risk_snapshot(result):
 
 def _ensure_session_dir():
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _format_file_size(size_bytes: int) -> str:
+    units = ["B", "KB", "MB", "GB"]
+    size = float(size_bytes)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} {unit}"
+        size /= 1024
+    return f"{int(size_bytes)} B"
+
+
+def _get_report_files():
+    return sorted(REPORTS_DIR.glob("release_attestation_*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _render_report_history_panel():
+    report_files = _get_report_files()
+    count = len(report_files)
+    st.markdown(
+        f'<div class="ri-card" style="margin-top:0;"><b>Report History</b><br><span class="ri-subtle">{count} saved report(s)</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("Open History", expanded=False):
+        if not report_files:
+            st.info("No previous attestation reports found yet.")
+            return
+
+        options = []
+        for path in report_files:
+            generated_local = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            options.append(f"{generated_local} | {path.name}")
+
+        selected_label = st.selectbox(
+            "Select report",
+            options=options,
+            index=0,
+            key="report_history_select_top",
+            label_visibility="collapsed",
+        )
+        selected_name = selected_label.split(" | ", 1)[1]
+        selected_path = next((p for p in report_files if p.name == selected_name), None)
+
+        if selected_path:
+            stat = selected_path.stat()
+            st.caption(f"Size: {_format_file_size(stat.st_size)}")
+            st.download_button(
+                label="Download",
+                data=selected_path.read_bytes(),
+                file_name=selected_path.name,
+                mime="application/pdf",
+                key="report_history_download_top",
+                use_container_width=True,
+            )
+
+
+def _render_report_history_page():
+    st.subheader("Report History")
+    st.markdown('<div class="ri-card"><span class="ri-subtle">All previously generated attestation PDFs.</span></div>', unsafe_allow_html=True)
+
+    report_files = _get_report_files()
+    if not report_files:
+        st.info("No previous attestation reports found yet.")
+        return
+
+    history_rows = []
+    for path in report_files:
+        stat = path.stat()
+        history_rows.append(
+            {
+                "Report": path.name,
+                "Generated": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                "Size": _format_file_size(stat.st_size),
+            }
+        )
+
+    history_df = pd.DataFrame.from_records(history_rows)
+    st.dataframe(history_df, use_container_width=True, hide_index=True)
+
+    selected_name = st.selectbox(
+        "Select report to download",
+        options=[p.name for p in report_files],
+        index=0,
+        key="report_history_page_select",
+    )
+    selected_path = next((p for p in report_files if p.name == selected_name), None)
+    if selected_path:
+        st.download_button(
+            label="Download Selected Report",
+            data=selected_path.read_bytes(),
+            file_name=selected_path.name,
+            mime="application/pdf",
+            key="report_history_page_download",
+        )
 
 
 def _save_manifest(services):
@@ -647,13 +767,15 @@ def _render_workflow_controls():
             mime="application/pdf",
         )
 
-
 def main():
     if "session_id" not in st.session_state:
         st.session_state.session_id = "current-session"
 
     if "stage1_complete" not in st.session_state:
         st.session_state.stage1_complete = False
+
+    if "current_view" not in st.session_state:
+        st.session_state.current_view = "home"
 
     st.set_page_config(page_title="Release Intelligence", layout="wide")
     _inject_ui_theme()
@@ -667,6 +789,20 @@ def main():
         """,
         unsafe_allow_html=True,
     )
+
+    view_label = st.radio(
+        "Navigation",
+        options=["Home", "Report History"],
+        horizontal=True,
+        label_visibility="collapsed",
+        index=0 if st.session_state.current_view == "home" else 1,
+        key="nav_segmented",
+    )
+    st.session_state.current_view = "home" if view_label == "Home" else "reports"
+
+    if st.session_state.current_view == "reports":
+        _render_report_history_page()
+        return
 
     _render_service_inputs()
 
