@@ -1,10 +1,11 @@
-# Release Intelligence (RI) System
+## Release Intelligence (RI) System
 <p align="center">
 <img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python">
 <img src="https://img.shields.io/badge/UI-Streamlit-FF4B4B.svg" alt="Streamlit">
 <img src="https://img.shields.io/badge/Cloud-Azure%20AI%20Foundry-0078D4.svg" alt="Azure">
 <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
 </p>
+
 ## Overview
 The Release Intelligence (RI) system is an **AI-powered security review and attestation platform** that automates the analysis of security vulnerabilities across microservices. It combines expert security agents, policy governance, and human-in-the-loop (HITL) workflows to generate comprehensive release attestation reports.
 
