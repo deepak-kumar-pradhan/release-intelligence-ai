@@ -19,31 +19,59 @@ The Release Intelligence (RI) system is an **AI-powered security review and atte
 ## Architecture At A Glance
 
 ```mermaid
-flowchart TD
-    A[User opens RI Portal] --> B[Submit release manifest]
-    B --> C[Workflow Orchestrator]
-    C --> D[Fetch findings via MCP<br/>Sonar + Checkmarx]
-    D --> E[Aggregate,normalize findings]
-    E --> F[Expert Security Agent<br/>triage and risk scoring]
-    F --> G[Policy Agent<br/>governance evaluation]
+flowchart TB
+    %% Compact, screenshot-friendly architecture for portal submission
 
-    G --> H{Policy Decision}
-    H -->|PASS| I[Approve release]
-    H -->|AMBER| J[Human-in-the-Loop review]
-    J -->|Approved| I
-    J -->|Rejected| K[Reject release]
-    H -->|FAIL| K
+    U[Developer + Security Reviewer]
 
-    I --> L[Generate final Report]
-    K --> L
+    subgraph D["Build and Deploy"]
+        GH[GitHub + Copilot]
+        CI[GitHub Actions]
+        ACR[Azure Container Registry]
+        ACA[Azure Container Apps]
+        GH --> CI --> ACR --> ACA
+    end
 
-    L --> M[Upload report to Azure Blob Storage]
-    M --> N[Append evidence ledger record]
-    N --> O[Show final status]
+    subgraph R["Release Intelligence Runtime"]
+        UI[Portal UI]
+        ORCH[Workflow Orchestrator]
+        EXP[Expert Agent]
+        POL[Policy Agent]
+        HITL[HITL Approval]
+        PDF[Attestation PDF]
+        LED[Evidence Ledger]
+        UI --> ORCH --> EXP --> POL
+        POL --> HITL --> PDF
+        POL --> PDF
+        ORCH --> LED
+    end
 
-    P[OpenTelemetry / App Insights] -. trace spans .-> C
-    P -. trace spans .-> F
-    P -. trace spans .-> G
+    subgraph A["Microsoft AI and Data Plane"]
+        FND[Azure AI Foundry + Agent Framework]
+        AOAI[Azure OpenAI Model]
+        MCP[Azure MCP Integration]
+        SONAR[Sonar]
+        CHK[Checkmarx]
+        BLOB[Azure Blob Storage]
+        OBS[App Insights + OpenTelemetry]
+        ID[Microsoft Entra ID]
+        FND --> AOAI
+        MCP --> SONAR
+        MCP --> CHK
+    end
+
+    U --> UI
+    ACA --> UI
+    EXP --> FND
+    POL --> FND
+    ORCH --> MCP
+    PDF --> BLOB
+    ORCH --> OBS
+    EXP --> OBS
+    POL --> OBS
+    ID --> ACA
+    ID --> FND
+    ID --> BLOB
 ```
 
 ## Tech Stack and Tools
