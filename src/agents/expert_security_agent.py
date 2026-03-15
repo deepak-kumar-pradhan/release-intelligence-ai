@@ -1,17 +1,18 @@
 import os
 import json
 import hashlib
-from datetime import datetime, timezone
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List
-from uuid import uuid4
+from typing import Any, Dict, Iterator, List, Tuple
 
-import requests
+try:
+    from azure.ai.projects import AIProjectClient
+    from azure.identity import DefaultAzureCredential
+except ImportError:
+    AIProjectClient = None
+    DefaultAzureCredential = None
 
 from src.observability import get_tracer
-
-# Local OpenAI SDK path is intentionally disabled for Foundry-first execution.
-OpenAI = None
 
 
 class ExpertSecurityAgent:
@@ -21,35 +22,30 @@ class ExpertSecurityAgent:
         self.max_llm_findings = self._coerce_int(os.getenv("LLM_MAX_FINDINGS_PER_SERVICE", "2"), default=2)
         self.max_response_tokens = 220
         self.cache_enabled = os.getenv("LLM_CACHE_ENABLED", "true").lower() == "true"
-        self.foundry_expert_responses_endpoint = os.getenv("FOUNDRY_EXPERT_RESPONSES_ENDPOINT", "").strip()
-        self.foundry_expert_activity_endpoint = os.getenv("FOUNDRY_EXPERT_ACTIVITY_ENDPOINT", "").strip()
-        foundry_key = os.getenv("FOUNDRY_API_KEY", "").strip()
-        foundry_key_valid = bool(foundry_key and not self._is_placeholder_secret(foundry_key))
-        self.foundry_api_key = foundry_key if foundry_key_valid else ""
+        self.foundry_project_endpoint = os.getenv("AZURE_AI_PROJECT_ENDPOINT", "").strip()
+        self.foundry_expert_agent_name = os.getenv("FOUNDRY_EXPERT_AGENT_NAME", "").strip()
+        self.foundry_expert_agent_version = os.getenv("FOUNDRY_EXPERT_AGENT_VERSION", "").strip()
         self.expert_foundry_enabled = bool(
-            self.foundry_expert_responses_endpoint
-            and self.foundry_api_key
-            and not self._is_placeholder_secret(self.foundry_api_key)
+            self.foundry_project_endpoint
+            and self.foundry_expert_agent_name
+            and AIProjectClient is not None
+            and DefaultAzureCredential is not None
         )
         self.cache_path = Path(os.getenv("LLM_CACHE_PATH", "session/llm_cache.json"))
         self._cache = self._load_cache()
         self.tracer = get_tracer("release_intelligence.expert_security_agent")
-        self.client = self._build_client() if use_llm else None
         if self.expert_foundry_enabled:
             print(
-                f"[LLM][ExpertSecurityAgent] Foundry responses enabled endpoint={self.foundry_expert_responses_endpoint}"
+                "[LLM][ExpertSecurityAgent] Foundry Agent Service enabled "
+                f"project_endpoint={self.foundry_project_endpoint} agent_name={self.foundry_expert_agent_name}"
             )
-            if self.foundry_expert_activity_endpoint:
+            if self.foundry_expert_agent_version:
                 print(
-                    f"[LLM][ExpertSecurityAgent] Foundry activity trace endpoint enabled endpoint={self.foundry_expert_activity_endpoint}"
+                    "[LLM][ExpertSecurityAgent] Foundry agent version pinned "
+                    f"version={self.foundry_expert_agent_version}"
                 )
-        if not use_llm:
-            print("[LLM][ExpertSecurityAgent] Disabled: Foundry endpoint or key unavailable")
-
-    def _build_client(self):
-        if OpenAI is None:
-            print("[LLM][ExpertSecurityAgent] OpenAI SDK path disabled")
-        return None
+        else:
+            print("[LLM][ExpertSecurityAgent] Disabled: Foundry Agent Service config or SDK unavailable")
 
     def _is_placeholder_secret(self, value: str) -> bool:
         normalized = str(value or "").strip()
@@ -58,11 +54,34 @@ class ExpertSecurityAgent:
         upper = normalized.upper()
         return upper.startswith("REPLACE_WITH_") or "YOUR_" in upper
 
+    def _extract_object_attr(self, value: Any, key: str, default: Any = None) -> Any:
+        if isinstance(value, dict):
+            return value.get(key, default)
+        return getattr(value, key, default)
+
+    @contextmanager
+    def _open_agent_service_clients(self) -> Iterator[Tuple[Any, Any, Any]]:
+        if AIProjectClient is None or DefaultAzureCredential is None:
+            raise RuntimeError(
+                "azure-ai-projects and azure-identity are required for Foundry Agent Service execution."
+            )
+
+        credential = DefaultAzureCredential()
+        project_client = AIProjectClient(endpoint=self.foundry_project_endpoint, credential=credential)
+        openai_client = project_client.get_openai_client()
+        try:
+            yield credential, project_client, openai_client
+        finally:
+            for resource in (openai_client, project_client, credential):
+                close_fn = getattr(resource, "close", None)
+                if callable(close_fn):
+                    close_fn()
+
     def analyze_service_findings(self, service_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         with self.tracer.start_as_current_span("expert_security_agent.analyze_service_findings") as span:
             if not self.expert_foundry_enabled:
                 raise RuntimeError(
-                    "Expert agent requires Foundry, but the Foundry expert endpoint or credentials are unavailable."
+                    "Expert agent requires Foundry Agent Service, but the project endpoint, agent name, or SDK dependencies are unavailable."
                 )
 
             service_name = service_payload.get("service_name", "unknown")
@@ -85,7 +104,7 @@ class ExpertSecurityAgent:
             analyses = []
             llm_calls = 0
             for finding in prioritized_findings:
-                if (self.client or self.expert_foundry_enabled) and llm_calls < self.max_llm_findings and self._should_use_llm_for_finding(finding):
+                if self.expert_foundry_enabled and llm_calls < self.max_llm_findings and self._should_use_llm_for_finding(finding):
                     analyses.append(self._llm_analyze_finding(finding))
                     llm_calls += 1
                 else:
@@ -125,87 +144,12 @@ class ExpertSecurityAgent:
             )
             try:
                 if self.expert_foundry_enabled:
-                    self._emit_foundry_activity_trace(prompt, span)
-                    llm_result = self._llm_analyze_finding_via_foundry(finding, prompt, span)
+                    llm_result = self._llm_analyze_finding_via_agent_service(finding, prompt, span)
                     if self.cache_enabled:
                         self._cache[cache_key] = llm_result
                         self._save_cache()
                     return llm_result
-
-                if not self.client:
-                    raise ValueError("No LLM client configured for expert finding triage")
-
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "You are a concise AppSec triage assistant. Return JSON only.",
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.0,
-                    max_tokens=self.max_response_tokens,
-                )
-                raw_content = response.choices[0].message.content or ""
-                parsed = self._parse_llm_json(raw_content)
-                span.set_attribute("llm.prompt_preview", prompt[:400])
-                usage = getattr(response, "usage", None)
-                if usage:
-                    span.set_attribute("llm.prompt_tokens", int(getattr(usage, "prompt_tokens", 0)))
-                    span.set_attribute("llm.completion_tokens", int(getattr(usage, "completion_tokens", 0)))
-                    span.set_attribute("llm.total_tokens", int(getattr(usage, "total_tokens", 0)))
-
-                remediation = str(parsed.get("remediation_diff", "")).strip()
-                triage_reasoning = str(parsed.get("triage_reasoning", "")).strip()
-                category = str(parsed.get("category", "WARNING")).upper() if parsed else "WARNING"
-                impact_score = self._coerce_int(parsed.get("impact_score", 7), default=7)
-                is_false_positive = bool(parsed.get("is_false_positive", False)) if parsed else False
-
-                if not remediation:
-                    remediation = "No remediation details returned by model."
-                if not triage_reasoning:
-                    triage_reasoning = "LLM analysis produced structured guidance."
-
-                llm_result = {
-                    "issue_id": parsed.get("issue_id", finding.get("id", "unknown")) if parsed else finding.get("id", "unknown"),
-                    "tool_source": parsed.get("tool_source", self._tool_source(finding)) if parsed else self._tool_source(finding),
-                    "is_false_positive": is_false_positive,
-                    "triage_reasoning": triage_reasoning,
-                    "remediation_diff": remediation,
-                    "impact_score": impact_score,
-                    "category": category,
-                    "confidence": "medium",
-                    "reason": triage_reasoning,
-                    "real_world_risk": triage_reasoning,
-                    "proposed_fix_snippet": remediation,
-                    "verification_steps": ["Validate fix with static scan and targeted unit/integration tests."],
-                    "finding_id": finding.get("id", "unknown"),
-                    "false_positive": is_false_positive,
-                    "severity": str(finding.get("severity", "UNKNOWN")).upper() or "UNKNOWN",
-                    "llm_raw_response": raw_content,
-                }
-                print(
-                    f"[LLM][ExpertSecurityAgent] Success finding_id={finding.get('id', 'unknown')} model={self.model}"
-                )
-                span.set_attribute("llm.category", category)
-                span.set_attribute("llm.impact_score", impact_score)
-                span.set_attribute("llm.false_positive", is_false_positive)
-                span.set_attribute("llm.triage_reasoning", triage_reasoning[:300])
-                span.set_attribute("llm.remediation_preview", remediation[:200])
-                span.set_attribute("llm.step", "security_finding_triage")
-                span.add_event("llm.response_received", {
-                    "model": self.model,
-                    "category": category,
-                    "impact_score": str(impact_score),
-                    "is_false_positive": str(is_false_positive),
-                })
-
-                if self.cache_enabled:
-                    self._cache[cache_key] = llm_result
-                    self._save_cache()
-
-                return llm_result
+                raise ValueError("Foundry Agent Service is not configured for expert finding triage")
             except Exception as error:
                 span.record_exception(error)
                 print(f"[LLM][ExpertSecurityAgent] Error finding_id={finding.get('id', 'unknown')}: {error}")
@@ -213,67 +157,49 @@ class ExpertSecurityAgent:
                     f"Expert Foundry mode failed for finding {finding.get('id', 'unknown')}: {error}"
                 ) from error
 
-    def _llm_analyze_finding_via_foundry(self, finding: Dict[str, Any], prompt: str, span) -> Dict[str, Any]:
-        headers = {
-            "Content-Type": "application/json",
-            "api-key": self.foundry_api_key,
-        }
-        body = {
-            "input": [
-                {
-                    "type": "message",
-                    "role": "system",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": "You are a concise AppSec triage assistant. Return JSON only.",
-                        }
-                    ],
-                },
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": prompt,
-                        }
-                    ],
-                },
-            ]
-        }
-
-        response = requests.post(
-            self.foundry_expert_responses_endpoint,
-            headers=headers,
-            json=body,
-            timeout=45,
-        )
-        if not response.ok:
-            error_excerpt = (response.text or "").strip().replace("\n", " ")[:800]
-            span.set_attribute("llm.response_status", response.status_code)
-            span.set_attribute("llm.error_excerpt", error_excerpt[:300])
-            print(
-                "[LLM][ExpertSecurityAgent] Foundry responses call failed "
-                f"status={response.status_code} body={error_excerpt or 'empty'}"
+    def _llm_analyze_finding_via_agent_service(self, finding: Dict[str, Any], prompt: str, span) -> Dict[str, Any]:
+        conversation_id = ""
+        with self._open_agent_service_clients() as (_, _, openai_client):
+            conversation = openai_client.conversations.create(
+                items=[{"type": "message", "role": "user", "content": prompt}]
             )
-            raise ValueError(
-                "Foundry responses call failed "
-                f"status={response.status_code} body={error_excerpt or 'empty'}"
-            )
+            conversation_id = str(self._extract_object_attr(conversation, "id", ""))
+            if not conversation_id:
+                raise ValueError("Foundry Agent Service did not return a conversation id")
 
-        payload = response.json()
-        content = self._extract_foundry_text(payload)
-        parsed = self._parse_llm_json(content)
-        usage = payload.get("usage", {}) if isinstance(payload, dict) else {}
-        span.set_attribute("llm.provider", "azure_ai_foundry_responses")
-        span.set_attribute("llm.response_status", response.status_code)
-        span.set_attribute("llm.prompt_preview", prompt[:400])
+            agent_reference: Dict[str, Any] = {
+                "name": self.foundry_expert_agent_name,
+                "type": "agent_reference",
+            }
+            if self.foundry_expert_agent_version:
+                agent_reference["version"] = self.foundry_expert_agent_version
+
+            span.set_attribute("llm.provider", "azure_ai_foundry_agent_service")
+            span.set_attribute("llm.agent_name", self.foundry_expert_agent_name)
+            span.set_attribute("llm.conversation_id", conversation_id)
+            span.set_attribute("llm.prompt_preview", prompt[:400])
+
+            try:
+                response = openai_client.responses.create(
+                    conversation=conversation_id,
+                    extra_body={"agent_reference": agent_reference},
+                )
+            finally:
+                try:
+                    openai_client.conversations.delete(conversation_id=conversation_id)
+                except Exception as cleanup_error:
+                    span.add_event("expert.conversation_delete_failed", {"error": str(cleanup_error)[:300]})
+
+        usage = self._extract_object_attr(response, "usage", None)
         if usage:
-            span.set_attribute("llm.prompt_tokens", int(usage.get("input_tokens", 0)))
-            span.set_attribute("llm.completion_tokens", int(usage.get("output_tokens", 0)))
-            span.set_attribute("llm.total_tokens", int(usage.get("total_tokens", 0)))
+            span.set_attribute("llm.prompt_tokens", int(self._extract_object_attr(usage, "input_tokens", 0) or 0))
+            span.set_attribute("llm.completion_tokens", int(self._extract_object_attr(usage, "output_tokens", 0) or 0))
+            total_tokens = self._extract_object_attr(usage, "total_tokens", None)
+            if total_tokens is not None:
+                span.set_attribute("llm.total_tokens", int(total_tokens or 0))
 
+        content = self._extract_agent_service_text(response)
+        parsed = self._parse_llm_json(content)
         finding_result = self._normalize_foundry_finding_result(parsed, finding)
         span.set_attribute("llm.category", str(finding_result.get("category", ""))[:80])
         span.set_attribute("llm.impact_score", int(finding_result.get("impact_score", 0)))
@@ -291,7 +217,7 @@ class ExpertSecurityAgent:
             },
         )
         print(
-            f"[LLM][ExpertSecurityAgent] Success finding_id={finding.get('id', 'unknown')} model={self.model} (Foundry)"
+            f"[LLM][ExpertSecurityAgent] Success finding_id={finding.get('id', 'unknown')} agent={self.foundry_expert_agent_name}"
         )
         return finding_result
 
@@ -332,84 +258,30 @@ class ExpertSecurityAgent:
             "llm_raw_response": json.dumps(parsed, ensure_ascii=True),
         }
 
-    def _extract_foundry_text(self, response_payload: Dict[str, Any]) -> str:
-        if not isinstance(response_payload, dict):
-            return "{}"
-
-        output_text = response_payload.get("output_text")
+    def _extract_agent_service_text(self, response_payload: Any) -> str:
+        output_text = self._extract_object_attr(response_payload, "output_text", None)
         if isinstance(output_text, str) and output_text.strip():
             return output_text
 
-        output = response_payload.get("output", [])
+        output = self._extract_object_attr(response_payload, "output", [])
         if isinstance(output, list):
             parts: List[str] = []
             for item in output:
-                if not isinstance(item, dict):
-                    continue
-                content = item.get("content", [])
+                content = self._extract_object_attr(item, "content", [])
                 if not isinstance(content, list):
                     continue
                 for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    text_value = block.get("text") or block.get("output_text") or block.get("value")
+                    text_value = self._extract_object_attr(block, "text", None)
+                    if not text_value:
+                        text_value = self._extract_object_attr(block, "output_text", None)
+                    if not text_value:
+                        text_value = self._extract_object_attr(block, "value", None)
                     if isinstance(text_value, str) and text_value.strip():
                         parts.append(text_value)
             if parts:
                 return "\n".join(parts)
 
         return "{}"
-
-    def _emit_foundry_activity_trace(self, prompt: str, span) -> None:
-        if not self.foundry_expert_activity_endpoint:
-            return
-
-        headers = {
-            "Content-Type": "application/json",
-            "api-key": self.foundry_api_key,
-        }
-        activity_payload = {
-            "type": "message",
-            "id": str(uuid4()),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "serviceUrl": "https://ri-hackathon-resource.services.ai.azure.com",
-            "channelId": "release-intelligence",
-            "from": {"id": "release-intelligence-app", "name": "Release Intelligence"},
-            "conversation": {"id": str(uuid4())},
-            "recipient": {"id": "expert-security-agent"},
-            "text": prompt,
-        }
-
-        try:
-            response = requests.post(
-                self.foundry_expert_activity_endpoint,
-                headers=headers,
-                json=activity_payload,
-                timeout=20,
-            )
-            span.set_attribute("llm.activity_status", response.status_code)
-            if response.status_code in (200, 201, 202):
-                print(
-                    "[LLM][ExpertSecurityAgent] Foundry activity trace emitted "
-                    f"status={response.status_code}"
-                )
-                return
-
-            error_excerpt = (response.text or "").strip().replace("\n", " ")[:400]
-            span.add_event(
-                "expert.activity_emit_failed",
-                {
-                    "status": response.status_code,
-                    "error": error_excerpt,
-                },
-            )
-            print(
-                "[LLM][ExpertSecurityAgent] Foundry activity trace failed "
-                f"status={response.status_code} body={error_excerpt or 'empty'}"
-            )
-        except Exception as error:
-            span.add_event("expert.activity_emit_error", {"error": str(error)[:300]})
-            print(f"[LLM][ExpertSecurityAgent] Foundry activity trace error: {error}")
 
     def _heuristic_analyze_finding(self, finding: Dict[str, Any]) -> Dict[str, Any]:
         finding_id = finding.get("id", "unknown")

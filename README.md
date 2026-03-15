@@ -60,14 +60,19 @@ To use actual tools instead of mock data, set the following environment variable
 
 #### Azure AI Foundry (for AI Analysis)
 ```bash
-export FOUNDRY_API_KEY="your-foundry-api-key"
-export FOUNDRY_POLICY_RESPONSES_ENDPOINT="https://<resource>.services.ai.azure.com/api/projects/<project-id>/agents/<policy-agent-id>/responses?api-version=v1"
-export FOUNDRY_EXPERT_RESPONSES_ENDPOINT="https://<resource>.services.ai.azure.com/api/projects/<project-id>/agents/<expert-agent-id>/responses?api-version=v1"
-export FOUNDRY_POLICY_ACTIVITY_ENDPOINT="https://<resource>.services.ai.azure.com/api/projects/<project-id>/agents/<policy-agent-id>/activities?api-version=v1"
-export FOUNDRY_EXPERT_ACTIVITY_ENDPOINT="https://<resource>.services.ai.azure.com/api/projects/<project-id>/agents/<expert-agent-id>/activities?api-version=v1"
+export AZURE_AI_PROJECT_ENDPOINT="https://<resource>.services.ai.azure.com/api/projects/<project-name>"
+export AZURE_TENANT_ID="<entra-tenant-id>"
+export AZURE_CLIENT_ID="<app-registration-client-id>"
+export AZURE_CLIENT_SECRET="<app-registration-client-secret>"
+export FOUNDRY_POLICY_AGENT_NAME="policy-governance-agent"
+export FOUNDRY_POLICY_AGENT_VERSION=""
+export FOUNDRY_EXPERT_AGENT_NAME="expert-security-agent"
+export FOUNDRY_EXPERT_AGENT_VERSION=""
 export AZURE_OPENAI_DEPLOYMENT="gpt-4o-mini"
 export APPLICATIONINSIGHTS_CONNECTION_STRING="InstrumentationKey=...;IngestionEndpoint=https://..."
 ```
+
+The expert security agent and policy agent both use the Foundry Agent Service lifecycle through `azure-ai-projects`: each opens a conversation, invokes the configured agent by reference, reads the response, and deletes the conversation. This path authenticates with Entra ID. For Docker or other headless runs, set `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` for a service principal that has access to the Foundry project. For local non-container runs, `az login` or managed identity also works.
 
 #### SonarQube and Checkmarx (for Security Scanning)
 ```bash
