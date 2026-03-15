@@ -1,0 +1,56 @@
+{
+  "_notes": {
+    "usage": "JSON does not support // comments; this _notes block documents policy intent while keeping the file parseable.",
+    "decision_states": "Policy agents may emit PASS, FAIL, or AMBER. AMBER means conditional risk that requires human review.",
+    "hitl": "human_in_the_loop.trigger_on defines which outcomes pause automation and require reviewer action."
+  },
+  "policy_metadata": {
+    "version": "2026.1",
+    "org_standard": "ISO-27001-Agentic-Baseline",
+    "enforcement_mode": "Strict",
+    "_note": "Strict mode blocks or escalates releases when configured quality gates are violated."
+  },
+  "quality_gates": {
+    "sonarqube": {
+      "min_quality_gate_status": "PASSED",
+      "max_technical_debt_hours": 8,
+      "block_on_new_critical_issues": true,
+      "min_code_coverage_percent": 80,
+      "_note": "Baseline code-health gate: fail when quality status is below PASSED or critical quality constraints are violated."
+    },
+    "checkmarx_sast": {
+      "block_on": [
+        "CRITICAL",
+        "HIGH"
+      ],
+      "allow_amber_on": [
+        "MEDIUM"
+      ],
+      "false_positive_triage_required": true,
+      "_note": "CRITICAL/HIGH findings block. MEDIUM can be escalated as AMBER for reviewer judgement."
+    },
+    "checkmarx_sca": {
+      "block_on_malicious_packages": true,
+      "max_cvss_score_allowed": 8.9,
+      "allow_exceptions_for_dev_dependencies": true,
+      "_note": "Dependency risk gate with CVSS threshold and optional dev-dependency exception handling."
+    }
+  },
+  "agentic_rules": {
+    "correlation_threshold": "HIGH",
+    "auto_fix_eligibility": [
+      "Sonar_Minor",
+      "SCA_Outdated_Library"
+    ],
+    "human_in_the_loop": {
+      "trigger_on": [
+        "AMBER_STATUS",
+        "POLICY_EXCEPTION_REQUEST"
+      ],
+      "required_role": "Security_Lead",
+      "timeout_hours": 24,
+      "_note": "When triggered, only the required reviewer role can finalize approval/rejection within the timeout window."
+    },
+    "_note": "Agentic controls define escalation, reviewer authority, and categories where automated fixes are acceptable."
+  }
+}

@@ -1,0 +1,13 @@
+services:
+  release-intelligence-ri:
+    build: .
+    image: release-intelligence-ri:latest
+    container_name: release-intelligence-ri
+    ports:
+      - "8503:8503"
+    volumes:
+      - ./reports:/app/reports
+      - ./session:/app/session
+    env_file:
+      - ./infra/.env.foundry
+    restart: unless-stopped
