@@ -1,10 +1,34 @@
 import unittest
 from src.workflow.ri_workflow import SecurityReviewWorkflow
 
+
+class StubExpertAgent:
+    def analyze_service_findings(self, service_payload):
+        return []
+
+
+class StubPolicyAgent:
+    def evaluate_release(self, summary_rows, rules, triage_findings=None):
+        return {
+            "status": "GO",
+            "reason": "Stub policy evaluation completed.",
+            "counts": {"critical": 0, "high": 0},
+            "requires_approval": False,
+            "decision_record": {
+                "final_decision": "PASS",
+                "policy_violations": [],
+                "approver_role_required": "Security_Lead",
+                "requires_approval": False,
+            },
+        }
+
 class TestSecurityReviewWorkflow(unittest.TestCase):
 
     def setUp(self):
-        self.workflow = SecurityReviewWorkflow()
+        self.workflow = SecurityReviewWorkflow(
+            expert_agent=StubExpertAgent(),
+            policy_agent=StubPolicyAgent(),
+        )
 
     def test_initialization(self):
         self.assertIsNotNone(self.workflow)

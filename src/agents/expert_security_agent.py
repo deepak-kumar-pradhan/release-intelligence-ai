@@ -1,9 +1,9 @@
 import os
 import json
 import hashlib
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 try:
     from azure.ai.projects import AIProjectClient
@@ -101,14 +101,24 @@ class ExpertSecurityAgent:
                 reverse=True,
             )
 
+            should_open_service_session = self.expert_foundry_enabled and self.max_llm_findings > 0 and any(
+                self._should_use_llm_for_finding(item) for item in prioritized_findings
+            )
+
             analyses = []
             llm_calls = 0
-            for finding in prioritized_findings:
-                if self.expert_foundry_enabled and llm_calls < self.max_llm_findings and self._should_use_llm_for_finding(finding):
-                    analyses.append(self._llm_analyze_finding(finding))
-                    llm_calls += 1
-                else:
-                    analyses.append(self._heuristic_analyze_finding(finding))
+            session_context = (
+                self._open_service_review_session(service_payload, span)
+                if should_open_service_session
+                else nullcontext(None)
+            )
+            with session_context as service_session:
+                for finding in prioritized_findings:
+                    if self.expert_foundry_enabled and llm_calls < self.max_llm_findings and self._should_use_llm_for_finding(finding):
+                        analyses.append(self._llm_analyze_finding(finding, service_session=service_session))
+                        llm_calls += 1
+                    else:
+                        analyses.append(self._heuristic_analyze_finding(finding))
 
             span.set_attribute("findings.total", len(findings))
             span.set_attribute("findings.llm_calls", llm_calls)
@@ -120,7 +130,59 @@ class ExpertSecurityAgent:
             analyses.extend(self._detect_toxic_combinations(sonar_findings, sca_findings))
             return analyses
 
-    def _llm_analyze_finding(self, finding: Dict[str, Any]) -> Dict[str, Any]:
+    @contextmanager
+    def _open_service_review_session(self, service_payload: Dict[str, Any], span) -> Iterator[Dict[str, Any]]:
+        conversation_id = ""
+        with self._open_agent_service_clients() as (_, _, openai_client):
+            conversation = openai_client.conversations.create(
+                items=[
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": self._build_service_review_session_prompt(service_payload),
+                    }
+                ]
+            )
+            conversation_id = str(self._extract_object_attr(conversation, "id", ""))
+            if not conversation_id:
+                raise ValueError("Foundry Agent Service did not return a conversation id")
+
+            span.set_attribute("llm.service_conversation_id", conversation_id)
+            span.add_event(
+                "expert.service_session_started",
+                {"conversation_id": conversation_id, "service_name": str(service_payload.get("service_name", "unknown"))},
+            )
+            try:
+                yield {
+                    "openai_client": openai_client,
+                    "conversation_id": conversation_id,
+                }
+            finally:
+                try:
+                    openai_client.conversations.delete(conversation_id=conversation_id)
+                except Exception as cleanup_error:
+                    span.add_event("expert.service_session_delete_failed", {"error": str(cleanup_error)[:300]})
+
+    def _build_service_review_session_prompt(self, service_payload: Dict[str, Any]) -> str:
+        sonar_findings = service_payload.get("sonar", {}).get("issues", [])
+        sast_findings = service_payload.get("checkmarx", {}).get("sast", {}).get("findings", [])
+        sca_findings = service_payload.get("checkmarx", {}).get("sca", {}).get("findings", [])
+        service_context = {
+            "service_name": service_payload.get("service_name", "unknown"),
+            "release_version": service_payload.get("release_version", "main"),
+            "sonar_issue_count": len(sonar_findings),
+            "sast_finding_count": len(sast_findings),
+            "sca_finding_count": len(sca_findings),
+        }
+
+        return (
+            "You are the expert security triage agent for a single release review. "
+            "Maintain memory across all subsequent findings in this conversation so you can detect correlated risk, repeated patterns, and compound exploit paths. "
+            "For each later finding, respond with JSON only using the requested schema. "
+            f"Service context: {json.dumps(service_context, separators=(',', ':'))}"
+        )
+
+    def _llm_analyze_finding(self, finding: Dict[str, Any], service_session: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         compact_finding = self._compact_finding(finding)
         cache_key = self._cache_key(compact_finding)
         with self.tracer.start_as_current_span("expert_security_agent.llm_analyze_finding") as span:
@@ -144,7 +206,9 @@ class ExpertSecurityAgent:
             )
             try:
                 if self.expert_foundry_enabled:
-                    llm_result = self._llm_analyze_finding_via_agent_service(finding, prompt, span)
+                    if service_session is None:
+                        raise ValueError("Foundry service review session was not initialized for expert finding triage")
+                    llm_result = self._llm_analyze_finding_via_agent_service(finding, prompt, span, service_session)
                     if self.cache_enabled:
                         self._cache[cache_key] = llm_result
                         self._save_cache()
@@ -157,38 +221,36 @@ class ExpertSecurityAgent:
                     f"Expert Foundry mode failed for finding {finding.get('id', 'unknown')}: {error}"
                 ) from error
 
-    def _llm_analyze_finding_via_agent_service(self, finding: Dict[str, Any], prompt: str, span) -> Dict[str, Any]:
-        conversation_id = ""
-        with self._open_agent_service_clients() as (_, _, openai_client):
-            conversation = openai_client.conversations.create(
-                items=[{"type": "message", "role": "user", "content": prompt}]
-            )
-            conversation_id = str(self._extract_object_attr(conversation, "id", ""))
-            if not conversation_id:
-                raise ValueError("Foundry Agent Service did not return a conversation id")
+    def _llm_analyze_finding_via_agent_service(
+        self,
+        finding: Dict[str, Any],
+        prompt: str,
+        span,
+        service_session: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        openai_client = service_session["openai_client"]
+        conversation_id = str(service_session["conversation_id"])
 
-            agent_reference: Dict[str, Any] = {
-                "name": self.foundry_expert_agent_name,
-                "type": "agent_reference",
-            }
-            if self.foundry_expert_agent_version:
-                agent_reference["version"] = self.foundry_expert_agent_version
+        agent_reference: Dict[str, Any] = {
+            "name": self.foundry_expert_agent_name,
+            "type": "agent_reference",
+        }
+        if self.foundry_expert_agent_version:
+            agent_reference["version"] = self.foundry_expert_agent_version
 
-            span.set_attribute("llm.provider", "azure_ai_foundry_agent_service")
-            span.set_attribute("llm.agent_name", self.foundry_expert_agent_name)
-            span.set_attribute("llm.conversation_id", conversation_id)
-            span.set_attribute("llm.prompt_preview", prompt[:400])
+        span.set_attribute("llm.provider", "azure_ai_foundry_agent_service")
+        span.set_attribute("llm.agent_name", self.foundry_expert_agent_name)
+        span.set_attribute("llm.conversation_id", conversation_id)
+        span.set_attribute("llm.prompt_preview", prompt[:400])
 
-            try:
-                response = openai_client.responses.create(
-                    conversation=conversation_id,
-                    extra_body={"agent_reference": agent_reference},
-                )
-            finally:
-                try:
-                    openai_client.conversations.delete(conversation_id=conversation_id)
-                except Exception as cleanup_error:
-                    span.add_event("expert.conversation_delete_failed", {"error": str(cleanup_error)[:300]})
+        openai_client.conversations.items.create(
+            conversation_id=conversation_id,
+            items=[{"type": "message", "role": "user", "content": prompt}],
+        )
+        response = openai_client.responses.create(
+            conversation=conversation_id,
+            extra_body={"agent_reference": agent_reference},
+        )
 
         usage = self._extract_object_attr(response, "usage", None)
         if usage:
