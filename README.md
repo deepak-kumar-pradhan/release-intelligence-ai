@@ -1,5 +1,10 @@
 # Release Intelligence (RI) System
-
+<p align="center">
+<img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python">
+<img src="https://img.shields.io/badge/UI-Streamlit-FF4B4B.svg" alt="Streamlit">
+<img src="https://img.shields.io/badge/Cloud-Azure%20AI%20Foundry-0078D4.svg" alt="Azure">
+<img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
+</p>
 ## Overview
 The Release Intelligence (RI) system is an **AI-powered security review and attestation platform** that automates the analysis of security vulnerabilities across microservices. It combines expert security agents, policy governance, and human-in-the-loop (HITL) workflows to generate comprehensive release attestation reports.
 
@@ -9,6 +14,36 @@ The Release Intelligence (RI) system is an **AI-powered security review and atte
 - 🤝 **HITL Workflow**: Pauses for Security Lead approval when policy violations detected
 - 📄 **PDF Attestation**: Generates styled reports with KPIs, charts, and policy decisions
 - 🧠 **Cloud Agent Runtime**: Expert and Policy agents run via Azure AI Foundry endpoints with traceable execution
+
+## Architecture At A Glance
+
+```mermaid
+flowchart TD
+    A[User opens RI Portal] --> B[Submit release manifest]
+    B --> C[Workflow Orchestrator]
+    C --> D[Fetch findings via MCP<br/>Sonar + Checkmarx]
+    D --> E[Aggregate,normalize findings]
+    E --> F[Expert Security Agent<br/>triage and risk scoring]
+    F --> G[Policy Agent<br/>governance evaluation]
+
+    G --> H{Policy Decision}
+    H -->|PASS| I[Approve release]
+    H -->|AMBER| J[Human-in-the-Loop review]
+    J -->|Approved| I
+    J -->|Rejected| K[Reject release]
+    H -->|FAIL| K
+
+    I --> L[Generate final Report]
+    K --> L
+
+    L --> M[Upload report to Azure Blob Storage]
+    M --> N[Append evidence ledger record]
+    N --> O[Show final status]
+
+    P[OpenTelemetry / App Insights] -. trace spans .-> C
+    P -. trace spans .-> F
+    P -. trace spans .-> G
+```
 
 ## Tech Stack and Tools
 
