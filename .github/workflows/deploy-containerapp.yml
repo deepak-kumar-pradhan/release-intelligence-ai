@@ -53,8 +53,16 @@ jobs:
 
           echo "IMAGE_SHA_TAG=${IMAGE_SHA_TAG}" >> "$GITHUB_ENV"
 
-      - name: Deploy new image to Azure Container App
+      - name: Deploy latest image to existing Azure Container App
         run: |
+          set -euo pipefail
+
+          if ! az containerapp show --name "$CONTAINER_APP_NAME" --resource-group "$RESOURCE_GROUP" >/dev/null 2>&1; then
+            echo "Container App '$CONTAINER_APP_NAME' was not found in resource group '$RESOURCE_GROUP'."
+            echo "This workflow only deploys to an existing app."
+            exit 1
+          fi
+
           az containerapp update \
             --name "$CONTAINER_APP_NAME" \
             --resource-group "$RESOURCE_GROUP" \
