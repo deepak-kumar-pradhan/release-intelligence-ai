@@ -10,6 +10,7 @@ env:
   IMAGE_REPOSITORY: release-intelligence-ri
   CONTAINER_APP_NAME: release-intelligence-ri
   RESOURCE_GROUP: rg-ri-hackathon
+  AZURE_SUBSCRIPTION_ID: 380610ea-ded5-4a19-a621-381bacb3ba8a
 
 jobs:
   build-push-deploy:
@@ -26,6 +27,12 @@ jobs:
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Select target Azure subscription
+        run: |
+          set -euo pipefail
+          az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+          az account show --query "{name:name,id:id,tenantId:tenantId}" -o table
 
       - name: Login to ACR
         uses: docker/login-action@v3
