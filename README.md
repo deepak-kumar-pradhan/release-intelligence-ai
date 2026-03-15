@@ -58,12 +58,14 @@ pip install -r requirements.txt
 ### 4. Configure for Live Demo with Real Tools
 To use actual tools instead of mock data, set the following environment variables:
 
-#### Azure OpenAI (for AI Analysis)
+#### Azure AI Foundry (for AI Analysis)
 ```bash
-export AZURE_OPENAI_API_KEY="your-azure-openai-api-key"
-export AZURE_OPENAI_ENDPOINT="https://your-resource.openai.azure.com/openai/v1"
+export FOUNDRY_API_KEY="your-foundry-api-key"
+export FOUNDRY_POLICY_RESPONSES_ENDPOINT="https://<resource>.services.ai.azure.com/api/projects/<project-id>/agents/<policy-agent-id>/responses?api-version=v1"
+export FOUNDRY_EXPERT_RESPONSES_ENDPOINT="https://<resource>.services.ai.azure.com/api/projects/<project-id>/agents/<expert-agent-id>/responses?api-version=v1"
+export FOUNDRY_POLICY_ACTIVITY_ENDPOINT="https://<resource>.services.ai.azure.com/api/projects/<project-id>/agents/<policy-agent-id>/activities?api-version=v1"
+export FOUNDRY_EXPERT_ACTIVITY_ENDPOINT="https://<resource>.services.ai.azure.com/api/projects/<project-id>/agents/<expert-agent-id>/activities?api-version=v1"
 export AZURE_OPENAI_DEPLOYMENT="gpt-4o-mini"
-export AZURE_OPENAI_API_VERSION="2024-07-18"
 export APPLICATIONINSIGHTS_CONNECTION_STRING="InstrumentationKey=...;IngestionEndpoint=https://..."
 ```
 

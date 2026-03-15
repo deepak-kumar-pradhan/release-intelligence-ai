@@ -8,33 +8,28 @@ import requests
 
 from src.observability import get_tracer
 
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None
+# Local OpenAI SDK path is intentionally disabled for Foundry-first execution.
+OpenAI = None
 
 
 class PolicyAgent:
     def __init__(self, use_llm: bool = False):
         self.use_llm = use_llm
         self.model = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
-        self.max_response_tokens = self._coerce_int(os.getenv("POLICY_LLM_MAX_RESPONSE_TOKENS", "180"), default=180)
+        self.max_response_tokens = 180
         self.llm_only_amber = os.getenv("POLICY_LLM_ONLY_AMBER", "true").lower() == "true"
-        self.policy_foundry_only = os.getenv("POLICY_FOUNDRY_ONLY", "false").lower() == "true"
         self.foundry_responses_endpoint = os.getenv("FOUNDRY_POLICY_RESPONSES_ENDPOINT", "").strip()
         self.foundry_activity_endpoint = os.getenv("FOUNDRY_POLICY_ACTIVITY_ENDPOINT", "").strip()
         foundry_key = os.getenv("FOUNDRY_API_KEY", "").strip()
-        azure_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
         foundry_key_valid = bool(foundry_key and not self._is_placeholder_secret(foundry_key))
-        azure_key_valid = bool(azure_key and not self._is_placeholder_secret(azure_key))
-        self.foundry_api_key = foundry_key if foundry_key_valid else azure_key
+        self.foundry_api_key = foundry_key if foundry_key_valid else ""
         self.foundry_enabled = bool(
             self.foundry_responses_endpoint
             and self.foundry_api_key
             and not self._is_placeholder_secret(self.foundry_api_key)
         )
         self.tracer = get_tracer("release_intelligence.policy_agent")
-        self.client = self._build_client() if (use_llm and not self.policy_foundry_only) else None
+        self.client = self._build_client() if use_llm else None
         if self.foundry_enabled:
             print(
                 f"[LLM][PolicyAgent] Foundry responses enabled endpoint={self.foundry_responses_endpoint}"
@@ -43,32 +38,15 @@ class PolicyAgent:
                 print(
                     f"[LLM][PolicyAgent] Foundry activity trace endpoint enabled endpoint={self.foundry_activity_endpoint}"
                 )
-        if self.policy_foundry_only:
-            print("[LLM][PolicyAgent] Local OpenAI SDK path disabled (POLICY_FOUNDRY_ONLY=true)")
-        elif self.foundry_responses_endpoint and not (foundry_key_valid or azure_key_valid):
+        if self.foundry_responses_endpoint and not foundry_key_valid:
             print("[LLM][PolicyAgent] Foundry endpoint set, but API key is missing or placeholder")
         elif not use_llm:
-            print("[LLM][PolicyAgent] Disabled: missing AZURE_OPENAI_ENDPOINT/API_KEY")
+            print("[LLM][PolicyAgent] Disabled: Foundry endpoint or key unavailable")
 
     def _build_client(self):
         if OpenAI is None:
-            print("[LLM][PolicyAgent] OpenAI SDK import failed")
-            return None
-
-        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-        api_key = os.getenv("AZURE_OPENAI_API_KEY")
-        if not endpoint or not api_key or self._is_placeholder_secret(api_key):
-            print("[LLM][PolicyAgent] Missing endpoint or api_key")
-            return None
-
-        print(
-            f"[LLM][PolicyAgent] Initializing client model={self.model} endpoint={endpoint} api_key={'set' if api_key else 'missing'}"
-        )
-
-        return OpenAI(
-            base_url=endpoint,
-            api_key=api_key,
-        )
+            print("[LLM][PolicyAgent] OpenAI SDK path disabled")
+        return None
 
     def _is_placeholder_secret(self, value: str) -> bool:
         normalized = str(value or "").strip()
@@ -89,12 +67,12 @@ class PolicyAgent:
             final_decision = str(decision_record.get("final_decision", "FAIL")).upper()
             span.set_attribute("policy.final_decision", final_decision)
             span.set_attribute("policy.llm_only_amber", self.llm_only_amber)
-            span.set_attribute("policy.foundry_only", self.policy_foundry_only)
+            span.set_attribute("policy.foundry_only", True)
 
-            if not self.client and not self.foundry_enabled:
-                span.add_event("policy.deterministic_only")
-                print("[LLM][PolicyAgent] Using deterministic policy path")
-                return deterministic
+            if not self.foundry_enabled:
+                raise RuntimeError(
+                    "Policy agent requires Foundry, but the Foundry policy endpoint or credentials are unavailable."
+                )
 
             if self.llm_only_amber and final_decision != "AMBER":
                 span.add_event("policy.llm_skipped", {"reason": f"final_decision={final_decision}"})
@@ -112,8 +90,8 @@ class PolicyAgent:
                 return llm_decision
             except Exception as error:
                 span.record_exception(error)
-                print(f"[LLM][PolicyAgent] LLM evaluation failed, using deterministic path: {error}")
-                return deterministic
+                print(f"[LLM][PolicyAgent] Foundry mode failed: {error}")
+                raise RuntimeError(f"Policy Foundry mode failed: {error}") from error
 
     def _llm_evaluate(self, summary_rows: List[Dict[str, Any]], rules: Dict[str, Any], triage_findings: Dict[str, Any]) -> Dict[str, Any]:
         with self.tracer.start_as_current_span("policy_agent.llm_evaluate") as span:

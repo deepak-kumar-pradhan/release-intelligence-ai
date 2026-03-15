@@ -860,6 +860,10 @@ def _render_workflow_controls():
             st.error(f"Input validation failed: {error}")
             st.session_state.workflow_result = None
             return
+        except Exception as error:
+            st.error(f"Security review failed: {error}")
+            st.session_state.workflow_result = None
+            return
 
     result = st.session_state.workflow_result
     if not result:
@@ -988,6 +992,8 @@ def _render_workflow_controls():
                         st.rerun()
                     except ValueError as error:
                         st.error(f"Input validation failed: {error}")
+                    except Exception as error:
+                        st.error(f"Approval failed: {error}")
 
         with col_reject:
             if st.button("Reject Release", use_container_width=True):
@@ -1008,6 +1014,8 @@ def _render_workflow_controls():
                         st.rerun()
                     except ValueError as error:
                         st.error(f"Input validation failed: {error}")
+                    except Exception as error:
+                        st.error(f"Rejection failed: {error}")
         return
 
     # Final attestation PDF (includes manual review stamp if reviewer info present)

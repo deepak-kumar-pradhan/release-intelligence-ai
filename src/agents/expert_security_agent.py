@@ -10,10 +10,8 @@ import requests
 
 from src.observability import get_tracer
 
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None
+# Local OpenAI SDK path is intentionally disabled for Foundry-first execution.
+OpenAI = None
 
 
 class ExpertSecurityAgent:
@@ -21,16 +19,13 @@ class ExpertSecurityAgent:
         self.use_llm = use_llm
         self.model = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
         self.max_llm_findings = self._coerce_int(os.getenv("LLM_MAX_FINDINGS_PER_SERVICE", "2"), default=2)
-        self.max_response_tokens = self._coerce_int(os.getenv("LLM_MAX_RESPONSE_TOKENS", "220"), default=220)
+        self.max_response_tokens = 220
         self.cache_enabled = os.getenv("LLM_CACHE_ENABLED", "true").lower() == "true"
-        self.expert_foundry_only = os.getenv("EXPERT_FOUNDRY_ONLY", "false").lower() == "true"
         self.foundry_expert_responses_endpoint = os.getenv("FOUNDRY_EXPERT_RESPONSES_ENDPOINT", "").strip()
         self.foundry_expert_activity_endpoint = os.getenv("FOUNDRY_EXPERT_ACTIVITY_ENDPOINT", "").strip()
         foundry_key = os.getenv("FOUNDRY_API_KEY", "").strip()
-        azure_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
         foundry_key_valid = bool(foundry_key and not self._is_placeholder_secret(foundry_key))
-        azure_key_valid = bool(azure_key and not self._is_placeholder_secret(azure_key))
-        self.foundry_api_key = foundry_key if foundry_key_valid else azure_key
+        self.foundry_api_key = foundry_key if foundry_key_valid else ""
         self.expert_foundry_enabled = bool(
             self.foundry_expert_responses_endpoint
             and self.foundry_api_key
@@ -39,7 +34,7 @@ class ExpertSecurityAgent:
         self.cache_path = Path(os.getenv("LLM_CACHE_PATH", "session/llm_cache.json"))
         self._cache = self._load_cache()
         self.tracer = get_tracer("release_intelligence.expert_security_agent")
-        self.client = self._build_client() if (use_llm and not self.expert_foundry_only) else None
+        self.client = self._build_client() if use_llm else None
         if self.expert_foundry_enabled:
             print(
                 f"[LLM][ExpertSecurityAgent] Foundry responses enabled endpoint={self.foundry_expert_responses_endpoint}"
@@ -48,32 +43,13 @@ class ExpertSecurityAgent:
                 print(
                     f"[LLM][ExpertSecurityAgent] Foundry activity trace endpoint enabled endpoint={self.foundry_expert_activity_endpoint}"
                 )
-        if self.expert_foundry_only:
-            print("[LLM][ExpertSecurityAgent] Local OpenAI SDK path disabled (EXPERT_FOUNDRY_ONLY=true)")
-        elif not use_llm:
-            print("[LLM][ExpertSecurityAgent] Disabled: missing AZURE_OPENAI_ENDPOINT/API_KEY")
+        if not use_llm:
+            print("[LLM][ExpertSecurityAgent] Disabled: Foundry endpoint or key unavailable")
 
     def _build_client(self):
         if OpenAI is None:
-            print("[LLM][ExpertSecurityAgent] OpenAI SDK import failed")
-            return None
-
-        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-        api_key = os.getenv("AZURE_OPENAI_API_KEY")
-        print(
-            f"[LLM][ExpertSecurityAgent] Initializing client model={self.model} endpoint={endpoint} api_key={'set' if api_key else 'missing'}"
-        )
-        if not endpoint or not api_key or self._is_placeholder_secret(api_key):
-            print("[LLM][ExpertSecurityAgent] Missing endpoint or api_key")
-            return None
-
-        if "/openai/v1" not in endpoint:
-            print("[LLM][ExpertSecurityAgent] Warning: endpoint should typically end with /openai/v1")
-
-        return OpenAI(
-            base_url=endpoint,
-            api_key=api_key,
-        )
+            print("[LLM][ExpertSecurityAgent] OpenAI SDK path disabled")
+        return None
 
     def _is_placeholder_secret(self, value: str) -> bool:
         normalized = str(value or "").strip()
@@ -84,6 +60,11 @@ class ExpertSecurityAgent:
 
     def analyze_service_findings(self, service_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         with self.tracer.start_as_current_span("expert_security_agent.analyze_service_findings") as span:
+            if not self.expert_foundry_enabled:
+                raise RuntimeError(
+                    "Expert agent requires Foundry, but the Foundry expert endpoint or credentials are unavailable."
+                )
+
             service_name = service_payload.get("service_name", "unknown")
             span.set_attribute("service.name", service_name)
 
@@ -228,9 +209,9 @@ class ExpertSecurityAgent:
             except Exception as error:
                 span.record_exception(error)
                 print(f"[LLM][ExpertSecurityAgent] Error finding_id={finding.get('id', 'unknown')}: {error}")
-                fallback = self._heuristic_analyze_finding(finding)
-                fallback["reason"] = f"LLM unavailable: {error}. {fallback['reason']}"
-                return fallback
+                raise RuntimeError(
+                    f"Expert Foundry mode failed for finding {finding.get('id', 'unknown')}: {error}"
+                ) from error
 
     def _llm_analyze_finding_via_foundry(self, finding: Dict[str, Any], prompt: str, span) -> Dict[str, Any]:
         headers = {

@@ -47,9 +47,14 @@ class SecurityReviewWorkflow:
         self.tracer = get_tracer("release_intelligence.workflow")
         # Determine if using real tools based on environment variables
         use_real_mcp = bool(os.getenv("SONAR_URL") and os.getenv("CHECKMARX_URL") and os.getenv("MCP_API_KEY"))
-        llm_api_key = os.getenv("AZURE_OPENAI_API_KEY", "")
-        use_llm = bool(os.getenv("AZURE_OPENAI_ENDPOINT") and not self._is_placeholder_secret(llm_api_key))
-        llm_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+        foundry_key = os.getenv("FOUNDRY_API_KEY", "")
+        policy_foundry_endpoint = os.getenv("FOUNDRY_POLICY_RESPONSES_ENDPOINT", "")
+        expert_foundry_endpoint = os.getenv("FOUNDRY_EXPERT_RESPONSES_ENDPOINT", "")
+        use_llm = bool(
+            not self._is_placeholder_secret(foundry_key)
+            and (policy_foundry_endpoint or expert_foundry_endpoint)
+        )
+        llm_endpoint = policy_foundry_endpoint or expert_foundry_endpoint
         llm_model = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
         print(
             f"[WORKFLOW] Boot use_llm={use_llm} model={llm_model} endpoint={llm_endpoint or 'missing'} use_real_mcp={use_real_mcp}"
