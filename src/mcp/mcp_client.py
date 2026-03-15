@@ -1,3 +1,12 @@
+"""MCP client adapter for scanner data collection.
+
+This module abstracts SonarQube and Checkmarx access behind a single client.
+Key responsibilities:
+- Expose connection health for each scanner.
+- Return standardized Sonar/SAST/SCA payload shapes.
+- Support mock-server mode for demos and local testing.
+"""
+
 import os
 from typing import Any, Dict
 
@@ -5,6 +14,8 @@ from .mock_mcp_servers import MockMCPServers
 
 
 class MCPClient:
+    """Fetches security scan reports from mock or configured MCP endpoints."""
+
     def __init__(
         self,
         sonar_url: str = "",
@@ -49,6 +60,7 @@ class MCPClient:
         }
 
     def fetch_full_reports(self, service_name: str, branch_name: str) -> Dict[str, Any]:
+        # Surface both connectivity status and fetched payloads so callers can trace scanner availability.
         sonar_connected = self.connect_sonarqube()
         checkmarx_connected = self.connect_checkmarx()
 

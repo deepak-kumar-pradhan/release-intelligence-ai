@@ -10,6 +10,81 @@ The Release Intelligence (RI) system is an **AI-powered security review and atte
 - 📄 **PDF Attestation**: Generates styled reports with KPIs, charts, and policy decisions
 - 🧠 **Cloud Agent Runtime**: Expert and Policy agents run via Azure AI Foundry endpoints with traceable execution
 
+## Tech Stack and Tools
+
+### Core Platform
+- **Language**: Python 3.11
+- **UI**: Streamlit (`streamlit>=1.36.0`)
+- **Report Generation**: FPDF2 (`fpdf2>=2.7.9`)
+- **HTTP Integration**: Requests (`requests>=2.32.3`)
+
+### AI and Cloud Integration
+- **LLM SDK**: OpenAI Python SDK (`openai>=1.51.0`)
+- **Agent Runtime**: Azure AI Foundry Agent Service via `azure-ai-projects`
+- **Identity and Auth**: Azure Identity (`azure-identity>=1.17.1`), Entra ID credentials
+- **Artifact Storage**: Azure Blob Storage (`azure-storage-blob>=12.23.1`)
+
+### Security Data Sources
+- **SAST/SCA Providers**: Checkmarx
+- **Code Quality and Security Signals**: SonarQube
+- **MCP Adapter Layer**: `src/mcp/mcp_client.py` with mock-mode and live-mode wiring
+
+### Observability and Governance
+- **Tracing API/SDK**: OpenTelemetry (`opentelemetry-api==1.35.0`, `opentelemetry-sdk==1.35.0`)
+- **Azure Monitoring Exporter**: `azure-monitor-opentelemetry-exporter>=1.0.0b35`
+- **Governance Rules**: JSON policy packs in `governance/policy.json`
+- **Audit Evidence**: Hash-chained ledger in `session/evidence_ledger.jsonl`
+
+### Dev and Delivery Tooling
+- **Testing**: Pytest (`pytest>=9.0.0`)
+- **Containerization**: Docker multi-stage build (`Dockerfile`)
+- **Local Orchestration**: Docker Compose (`docker-compose.yml`)
+
+### Stack-to-Pipeline Map
+- **Ingest**: SonarQube + Checkmarx reports via MCP client (`src/mcp/mcp_client.py`)
+- **Analyze**: Expert Security Agent on Azure AI Foundry (`src/agents/expert_security_agent.py`)
+- **Decide**: Policy Agent + governance rules (`src/agents/policy_agent.py`, `governance/policy.json`)
+- **Approve**: HITL reviewer flow in Streamlit UI (`ui/app.py`)
+- **Attest**: PDF generation with FPDF2 (`src/workflow/ri_workflow.py`)
+- **Store**: Final artifacts in Azure Blob + tamper-evident local evidence ledger (`session/evidence_ledger.jsonl`)
+- **Observe**: OpenTelemetry traces exported to Azure Monitor/Application Insights
+
+## Azure Prerequisites (Create First)
+
+Create these resources in this order before running the live cloud path:
+
+1. **Resource Group**
+- Example: `rg-release-intelligence-dev`
+- Purpose: parent container for all project resources.
+
+2. **Azure AI Foundry Project (Azure AI services hub/project)**
+- Purpose: hosts your Expert and Policy agents and model deployment bindings.
+- Required env: `AZURE_AI_PROJECT_ENDPOINT`, `FOUNDRY_EXPERT_AGENT_NAME`, `FOUNDRY_POLICY_AGENT_NAME`, `AZURE_OPENAI_DEPLOYMENT`.
+
+3. **Model Deployment in the Foundry project**
+- Example model: `gpt-4o-mini` (or your approved equivalent).
+- Purpose: backing model used by Foundry agents.
+- Required env: `AZURE_OPENAI_DEPLOYMENT` should match the deployment name.
+
+4. **Microsoft Entra App Registration (Service Principal)**
+- Purpose: non-interactive auth for Docker/CI/headless runs.
+- Required env: `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`.
+- Minimum access: grant the app access to the Foundry project and related resources needed for runtime calls.
+
+5. **Application Insights (Azure Monitor)**
+- Purpose: distributed tracing and hackathon demo observability.
+- Required env: `APPLICATIONINSIGHTS_CONNECTION_STRING`.
+
+6. **Storage Account + Blob Container**
+- Purpose: store final attestation PDFs for `GO`/`REJECTED` outcomes.
+- Required env: `AZURE_STORAGE_CONNECTION_STRING`, `AZURE_STORAGE_CONTAINER`, optional `AZURE_STORAGE_BLOB_PREFIX`.
+
+7. **Optional: Key Vault (recommended for production)**
+- Purpose: securely store secrets instead of raw `.env` values.
+- Typical secrets: client secret, storage connection string, API keys.
+
+If you only want a local demo with mock data, Azure resources are optional. The app can run without Foundry/Blob/Insights and will fall back to mock MCP behavior.
+
 ## Directory Structure
 ```
 release-intelligence-ri/

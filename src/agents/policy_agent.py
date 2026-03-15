@@ -1,3 +1,13 @@
+"""Release governance policy agent.
+
+This module computes release decisions (PASS/AMBER/FAIL) from summary metrics,
+triage findings, and policy rules.
+Key responsibilities:
+- Run deterministic governance gates as the baseline source of truth.
+- Optionally escalate AMBER or full evaluations to Foundry Agent Service.
+- Normalize policy decisions into a stable contract used by workflow/HITL.
+"""
+
 import json
 import os
 from contextlib import contextmanager
@@ -14,7 +24,15 @@ from src.observability import get_tracer
 
 
 class PolicyAgent:
+    """Evaluates release governance using deterministic and optional LLM logic."""
+
     def __init__(self, use_llm: bool = False):
+        """Initialize policy evaluation mode, Foundry settings, and tracing hooks.
+
+        Loads environment-driven toggles for AMBER-only escalation and Foundry
+        agent references, then determines whether cloud policy evaluation is
+        executable in the current runtime.
+        """
         self.use_llm = use_llm
         self.model = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
         self.max_response_tokens = 180
@@ -43,6 +61,7 @@ class PolicyAgent:
             print("[LLM][PolicyAgent] Disabled: Foundry Agent Service config or SDK unavailable")
 
     def _is_placeholder_secret(self, value: str) -> bool:
+        """Return True when a configuration value appears unset or templated."""
         normalized = str(value or "").strip()
         if not normalized:
             return True
@@ -50,12 +69,14 @@ class PolicyAgent:
         return upper.startswith("REPLACE_WITH_") or "YOUR_" in upper
 
     def _extract_object_attr(self, value: Any, key: str, default: Any = None) -> Any:
+        """Read fields from either dict payloads or SDK objects with one helper."""
         if isinstance(value, dict):
             return value.get(key, default)
         return getattr(value, key, default)
 
     @contextmanager
     def _open_agent_service_clients(self) -> Iterator[Tuple[Any, Any, Any]]:
+        """Open Foundry clients and guarantee graceful close of all resources."""
         if AIProjectClient is None or DefaultAzureCredential is None:
             raise RuntimeError(
                 "azure-ai-projects and azure-identity are required for Foundry Agent Service execution."
@@ -78,7 +99,14 @@ class PolicyAgent:
         rules: Dict[str, Any],
         triage_findings: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """Evaluate governance for a release and return normalized workflow output.
+
+        Deterministic evaluation is always executed first as baseline policy truth.
+        If enabled, Foundry LLM evaluation is used as an escalation layer (typically
+        for AMBER decisions when `POLICY_LLM_ONLY_AMBER=true`).
+        """
         with self.tracer.start_as_current_span("policy_agent.evaluate_release") as span:
+            # Always compute the deterministic baseline first; LLM is an escalation layer, not a replacement.
             deterministic = self._deterministic_evaluate(summary_rows, rules, triage_findings or {})
             decision_record = deterministic.get("decision_record", {})
             final_decision = str(decision_record.get("final_decision", "FAIL")).upper()
@@ -111,6 +139,7 @@ class PolicyAgent:
                 raise RuntimeError(f"Policy Foundry mode failed: {error}") from error
 
     def _llm_evaluate(self, summary_rows: List[Dict[str, Any]], rules: Dict[str, Any], triage_findings: Dict[str, Any]) -> Dict[str, Any]:
+        """Build compact governance payload and request a Foundry policy decision."""
         with self.tracer.start_as_current_span("policy_agent.llm_evaluate") as span:
             payload = {
                 "summary_rows": self._compact_summary(summary_rows),
@@ -139,7 +168,9 @@ class PolicyAgent:
             raise ValueError("Foundry Agent Service is not configured for policy evaluation")
 
     def _llm_evaluate_via_agent_service(self, summary_rows: List[Dict[str, Any]], user_prompt: str, span) -> Dict[str, Any]:
+        """Execute one-shot Foundry policy conversation and normalize parsed JSON output."""
         with self._open_agent_service_clients() as (_, _, openai_client):
+            # Policy evaluation is one-shot per release, so a short-lived conversation is sufficient.
             conversation = openai_client.conversations.create(
                 items=[{"type": "message", "role": "user", "content": user_prompt}]
             )
@@ -203,6 +234,7 @@ class PolicyAgent:
         return self._normalize_decision(result, summary_rows)
 
     def _extract_agent_service_text(self, response_payload: Any) -> str:
+        """Extract textual content across different Foundry response envelope shapes."""
         output_text = self._extract_object_attr(response_payload, "output_text", None)
         if isinstance(output_text, str) and output_text.strip():
             return output_text
@@ -228,6 +260,7 @@ class PolicyAgent:
         return "{}"
 
     def _compact_summary(self, summary_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Reduce service summary rows to the minimal fields required by policy prompts."""
         compact_rows = []
         for row in summary_rows:
             compact_rows.append(
@@ -244,6 +277,7 @@ class PolicyAgent:
         return compact_rows
 
     def _compact_rules(self, rules: Dict[str, Any]) -> Dict[str, Any]:
+        """Project full governance rules into a compact policy-evaluation subset."""
         quality_gates = rules.get("quality_gates", {})
         return {
             "sonar_required": quality_gates.get("sonarqube", {}).get("min_quality_gate_status", "PASSED"),
@@ -253,6 +287,7 @@ class PolicyAgent:
         }
 
     def _compact_triage(self, triage_findings: Dict[str, Any]) -> Dict[str, Any]:
+        """Summarize triage outputs into counts and top-impact findings for LLM context."""
         top_findings = []
         warning_count = 0
         blocker_count = 0
@@ -285,6 +320,7 @@ class PolicyAgent:
         }
 
     def _coerce_int(self, value: Any, default: int = 0) -> int:
+        """Best-effort integer conversion used for robust risk scoring and sorting."""
         try:
             return int(value)
         except (TypeError, ValueError):
@@ -296,6 +332,12 @@ class PolicyAgent:
         rules: Dict[str, Any],
         triage_findings: Dict[str, Any],
     ) -> Dict[str, Any]:
+        """Apply strict deterministic governance gates and produce a decision record.
+
+        Gate ordering is intentional: production high-impact risk and critical
+        vulnerabilities are evaluated before less severe conditions to prevent
+        accidental downgrade of blocker outcomes.
+        """
         critical = 0
         high = 0
         has_sonar_fail = False
@@ -329,6 +371,7 @@ class PolicyAgent:
             if not item.get("is_false_positive", item.get("false_positive", False))
         )
 
+        # Apply strictest gates first so high-impact production risk cannot be downgraded by later checks.
         if has_high_impact_production:
             final_decision = "FAIL"
             reason = "Critical vulnerabilities detected; human approval required before release."
@@ -379,6 +422,12 @@ class PolicyAgent:
         return normalized
 
     def _normalize_decision(self, decision_record: Dict[str, Any], summary_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Normalize raw policy decision fields into workflow-compatible contract.
+
+        Ensures status mapping (`PASS->GO`, otherwise `NO-GO`), recomputes counts
+        from service summary rows, and enforces the invariant that PASS never
+        requires human approval.
+        """
         final_decision = str(decision_record.get("final_decision", "FAIL")).upper()
         status = "GO" if final_decision == "PASS" else "NO-GO"
         counts = {

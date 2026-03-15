@@ -1,3 +1,17 @@
+"""Release intelligence workflow orchestrator.
+
+This module coordinates the end-to-end security review lifecycle.
+Key responsibilities:
+- Validate inbound service/reviewer payloads.
+- Fetch scan data via MCP integrations.
+- Invoke expert triage and policy governance agents.
+- Drive HITL gating, attestation PDF generation, blob upload, and evidence ledger.
+
+Architecture map:
+MCP reports -> Expert triage -> Policy decision -> HITL gate -> PDF attestation ->
+Blob upload (optional) -> Evidence ledger append/verify.
+"""
+
 import json
 import re
 import hashlib
@@ -24,11 +38,14 @@ from src.observability import configure_observability, current_trace_id, get_tra
 
 
 class SecurityReviewWorkflow:
+    """Coordinates data collection, analysis, governance, and attestation outputs."""
+
     _SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9._ -]{1,64}$")
     _RELEASE_VERSION_RE = re.compile(r"^[A-Za-z0-9._/:-]{1,80}$")
     _VALID_REVIEWER_ACTIONS = {"APPROVED", "REJECTED"}
 
     def _is_placeholder_secret(self, value: str) -> bool:
+        """Return True when a secret-like value is empty or still templated."""
         value_normalized = str(value or "").strip()
         if not value_normalized:
             return True
@@ -43,6 +60,11 @@ class SecurityReviewWorkflow:
         policy_agent: Optional[PolicyAgent] = None,
         rules_path: str = "governance/policy.json",
     ):
+        """Initialize workflow dependencies, feature toggles, and storage settings.
+
+        Environment variables determine whether MCP live mode, Foundry agents,
+        and blob uploads are enabled.
+        """
         configure_observability()
         self.tracer = get_tracer("release_intelligence.workflow")
         # Determine if using real tools based on environment variables
@@ -78,6 +100,7 @@ class SecurityReviewWorkflow:
             self.blob_upload_enabled = False
 
     def execute(self) -> Dict[str, Any]:
+        """Compatibility entrypoint that runs orchestration with no services."""
         return self.orchestrate(services=[])
 
     def orchestrate(
@@ -90,6 +113,7 @@ class SecurityReviewWorkflow:
         reviewer_role: str = "",
         reviewer_identity_verified: bool = False,
     ) -> Dict[str, Any]:
+        """Validate inbound payloads and delegate to the security review pipeline."""
         normalized_services = self._validate_services(services or [])
         return self.run_security_review(
             services=normalized_services,
@@ -102,6 +126,7 @@ class SecurityReviewWorkflow:
         )
 
     def fetch_data(self, services: Optional[List[Dict[str, str]]] = None) -> Dict[str, Dict[str, Any]]:
+        """Fetch scanner reports for services in parallel via MCP client calls."""
         if services is None:
             return {}
 
@@ -111,11 +136,13 @@ class SecurityReviewWorkflow:
         return {item["service_name"]: item for item in results}
 
     def _fetch_service_data(self, service: Dict[str, str]) -> Dict[str, Any]:
+        """Fetch one service report bundle (Sonar + Checkmarx payloads)."""
         service_name = service.get("service_name", "Unknown Service")
         release_version = service.get("release_version", "main")
         return self.mcp_client.fetch_full_reports(service_name, release_version)
 
     def _validate_services(self, services: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """Validate and normalize service descriptors for safe downstream processing."""
         normalized: List[Dict[str, str]] = []
 
         for index, service in enumerate(services):
@@ -151,6 +178,7 @@ class SecurityReviewWorkflow:
         return normalized
 
     def aggregate_results(self, results: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Convert raw results into workflow summary rows or generic agent output rows."""
         if results is None:
             return []
 
@@ -166,6 +194,7 @@ class SecurityReviewWorkflow:
         ]
 
     def _build_service_summary(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Build normalized per-service counters used by governance and PDF views."""
         checkmarx = payload.get("checkmarx", {})
         sast = checkmarx.get("sast", {})
         sca = checkmarx.get("sca", {})
@@ -194,6 +223,11 @@ class SecurityReviewWorkflow:
         reviewer_role: str = "",
         reviewer_identity_verified: bool = False,
     ) -> Dict[str, Any]:
+        """Run full release review: fetch, analyze, govern, attest, and record evidence.
+
+        Returns a contract containing summary/deep-dive results, governance outcome,
+        HITL state, generated artifact paths, and trace metadata.
+        """
         with self.tracer.start_as_current_span("workflow.run_security_review") as span:
             run_id = self._new_run_id()
             span.set_attribute("services.count", len(services))
@@ -217,6 +251,7 @@ class SecurityReviewWorkflow:
                     service_span.set_attribute("service.name", service_name)
                     deep_dive[service_name] = {
                         "raw": payload,
+                        # Expert agent evaluates each service payload and returns normalized triage findings.
                         "analysis": self.expert_agent.analyze_service_findings(payload),
                     }
 
@@ -231,6 +266,7 @@ class SecurityReviewWorkflow:
             # If a reviewer has explicitly acted, do not pause — use their decision
             reviewer_acted = bool(reviewer_action_normalized)
             if reviewer_acted and not reviewer_principal_id_clean:
+                # Preserve accountability when an approval is provided without enterprise identity context.
                 reviewer_principal_id_clean = self._derive_self_asserted_principal_id(reviewer_name_clean)
                 reviewer_identity_verified_flag = False
 
@@ -361,6 +397,7 @@ class SecurityReviewWorkflow:
             }
 
     def _evaluate_governance(self, summary_rows: List[Dict[str, Any]], deep_dive: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply policy evaluation and enforce default fields for contract stability."""
         rules = self._load_rules()
         policy_version = rules.get("policy_metadata", {}).get("version", "unknown")
         result = self.policy_agent.evaluate_release(summary_rows, rules, deep_dive)
@@ -372,10 +409,12 @@ class SecurityReviewWorkflow:
         return result
 
     def _new_run_id(self) -> str:
+        """Generate unique run identifier with timestamp and random suffix."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return f"run_{timestamp}_{uuid4().hex[:8]}"
 
     def _summarize_analysis_stats(self, deep_dive: Dict[str, Any]) -> Dict[str, int]:
+        """Summarize analysis volume and false-positive totals for evidence records."""
         total_findings = 0
         false_positive_count = 0
         for payload in deep_dive.values():
@@ -390,10 +429,12 @@ class SecurityReviewWorkflow:
         }
 
     def _derive_self_asserted_principal_id(self, reviewer_name: str) -> str:
+        """Create deterministic pseudo-principal ID when enterprise identity is missing."""
         digest = hashlib.sha256(reviewer_name.encode("utf-8")).hexdigest()[:16]
         return f"self-asserted:{digest}"
 
     def _validate_reviewer_action(self, action: str) -> str:
+        """Normalize and validate reviewer action against allowed decision set."""
         normalized = str(action or "").strip().upper()
         if not normalized:
             return ""
@@ -404,14 +445,17 @@ class SecurityReviewWorkflow:
         return normalized
 
     def _append_evidence_record(self, record: Dict[str, Any]) -> None:
+        """Append tamper-evident run record to JSONL ledger with hash chaining."""
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
         payload = dict(record)
+        # Chain each record to the previous hash to make tampering detectable.
         payload["prev_record_hash"] = self._get_last_record_hash()
         payload["record_hash"] = self._hash_record(payload)
         with self.ledger_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
 
     def _get_last_record_hash(self) -> str:
+        """Return previous ledger hash, or GENESIS when ledger is empty/missing."""
         if not self.ledger_path.exists():
             return "GENESIS"
 
@@ -436,12 +480,14 @@ class SecurityReviewWorkflow:
         return hashlib.sha256(last_non_empty.encode("utf-8")).hexdigest()
 
     def _hash_record(self, record: Dict[str, Any]) -> str:
+        """Compute canonical SHA-256 hash for one ledger record payload."""
         hash_source = dict(record)
         hash_source.pop("record_hash", None)
         payload = json.dumps(hash_source, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
 
     def _upload_report_to_blob(self, pdf_path: str, run_id: str) -> Dict[str, Optional[str]]:
+        """Upload finalized attestation PDF to Azure Blob and return upload metadata."""
         if not self.blob_upload_enabled:
             return {"blob_path": None, "blob_url": None, "error": "Blob upload not configured."}
 
@@ -490,6 +536,7 @@ class SecurityReviewWorkflow:
             }
 
     def verify_evidence_ledger(self) -> Dict[str, Any]:
+        """Verify ledger JSON validity, hash continuity, and per-record integrity."""
         if not self.ledger_path.exists():
             return {
                 "valid": True,
@@ -540,6 +587,7 @@ class SecurityReviewWorkflow:
         }
 
     def _sha256_file(self, file_path: Optional[str]) -> Optional[str]:
+        """Return SHA-256 hash of a file, or None when path is absent/invalid."""
         if not file_path:
             return None
         path = Path(file_path)
@@ -553,6 +601,7 @@ class SecurityReviewWorkflow:
         return digest.hexdigest()
 
     def _load_rules(self) -> Dict[str, Any]:
+        """Load governance rules from disk, or return embedded secure defaults."""
         rules_file = Path(self.rules_path)
         if not rules_file.exists():
             return {
@@ -603,6 +652,7 @@ class SecurityReviewWorkflow:
         reviewer_name: Optional[str] = None,
         reviewer_action: Optional[str] = None,
     ) -> str:
+        """Render attestation PDF containing executive summary and deep-dive findings."""
         output_dir = Path("reports")
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"release_attestation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
@@ -623,6 +673,7 @@ class SecurityReviewWorkflow:
         )
 
         def write_block(text: str, line_height: int = 7):
+            """Write wrapped text block constrained to current content width."""
             pdf.set_x(pdf.l_margin)
             pdf.multi_cell(
                 content_width,
@@ -824,6 +875,7 @@ class SecurityReviewWorkflow:
         return str(output_path)
 
     def _draw_summary_table(self, pdf: FPDF, summary_rows: List[Dict[str, Any]], content_width: float) -> None:
+        """Draw tabular service summary with severity-aware color accents."""
         columns = [
             ("Service", 42),
             ("Version", 30),
@@ -884,6 +936,7 @@ class SecurityReviewWorkflow:
         pdf.set_text_color(0, 0, 0)
 
     def _draw_summary_chart(self, pdf: FPDF, summary_rows: List[Dict[str, Any]], content_width: float) -> None:
+        """Draw compact bar chart of critical/high findings by service."""
         if not summary_rows:
             return
 
@@ -946,9 +999,11 @@ class SecurityReviewWorkflow:
         pdf.set_y(chart_y + chart_h + 2)
 
     def _status_color(self, status: str):
+        """Map overall status string to RGB color used in the PDF header."""
         return (22, 163, 74) if status.upper() == "GO" else (184, 28, 53)
 
     def _severity_color(self, severity: str, false_positive: bool):
+        """Map finding severity/false-positive flag to report palette colors."""
         if false_positive:
             return (5, 150, 105)
 
@@ -962,6 +1017,7 @@ class SecurityReviewWorkflow:
         return (71, 85, 105)
 
     def _safe_pdf_text(self, value: str, width: int = 110) -> str:
+        """Normalize whitespace/newlines and wrap text for safe PDF rendering."""
         text = str(value).replace("\t", "    ").replace("\r\n", "\n").replace("\r", "\n")
         wrapped_lines = []
         for line in text.split("\n"):
@@ -976,4 +1032,5 @@ class SecurityReviewWorkflow:
         return "\n".join(wrapped_lines)
 
     def manage_hitl(self, aggregated_results):
+        """Reserved extension point for external HITL controller integrations."""
         return None

@@ -1,3 +1,13 @@
+"""Expert security triage agent.
+
+This module evaluates Sonar and Checkmarx findings for a single service release.
+Key responsibilities:
+- Prioritize findings by severity and select which ones should use LLM triage.
+- Reuse one Foundry conversation per service to preserve cross-finding context.
+- Normalize model output into a stable schema consumed by the workflow and PDF report.
+- Apply deterministic fallback heuristics and toxic-combination guardrails.
+"""
+
 import os
 import json
 import hashlib
@@ -16,7 +26,19 @@ from src.observability import get_tracer
 
 
 class ExpertSecurityAgent:
+    """Runs expert-level security analysis for service findings.
+
+    It combines deterministic heuristics with Foundry Agent Service calls and
+    returns normalized finding analyses used by governance and reporting layers.
+    """
+
     def __init__(self, use_llm: bool = False):
+        """Initialize agent configuration, Foundry wiring, cache, and tracing.
+
+        Reads environment-driven runtime knobs such as model name, cache behavior,
+        and Foundry agent references, then determines whether Foundry execution is
+        fully available in the current environment.
+        """
         self.use_llm = use_llm
         self.model = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
         self.max_llm_findings = self._coerce_int(os.getenv("LLM_MAX_FINDINGS_PER_SERVICE", "2"), default=2)
@@ -48,6 +70,7 @@ class ExpertSecurityAgent:
             print("[LLM][ExpertSecurityAgent] Disabled: Foundry Agent Service config or SDK unavailable")
 
     def _is_placeholder_secret(self, value: str) -> bool:
+        """Return True when a value looks empty or still uses template placeholders."""
         normalized = str(value or "").strip()
         if not normalized:
             return True
@@ -55,12 +78,14 @@ class ExpertSecurityAgent:
         return upper.startswith("REPLACE_WITH_") or "YOUR_" in upper
 
     def _extract_object_attr(self, value: Any, key: str, default: Any = None) -> Any:
+        """Read a field from dict-like or object-like SDK payloads with one helper."""
         if isinstance(value, dict):
             return value.get(key, default)
         return getattr(value, key, default)
 
     @contextmanager
     def _open_agent_service_clients(self) -> Iterator[Tuple[Any, Any, Any]]:
+        """Open Foundry project/OpenAI clients and ensure all resources close safely."""
         if AIProjectClient is None or DefaultAzureCredential is None:
             raise RuntimeError(
                 "azure-ai-projects and azure-identity are required for Foundry Agent Service execution."
@@ -78,6 +103,15 @@ class ExpertSecurityAgent:
                     close_fn()
 
     def analyze_service_findings(self, service_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Analyze all findings for one service and return normalized triage results.
+
+        Workflow:
+        1. Collect Sonar/SAST/SCA findings.
+        2. Prioritize by severity.
+        3. Use Foundry for selected high-risk findings within configured limits.
+        4. Use deterministic heuristics for remaining findings.
+        5. Add toxic-combination synthetic findings when correlated risk is detected.
+        """
         with self.tracer.start_as_current_span("expert_security_agent.analyze_service_findings") as span:
             if not self.expert_foundry_enabled:
                 raise RuntimeError(
@@ -101,6 +135,7 @@ class ExpertSecurityAgent:
                 reverse=True,
             )
 
+            # Open one service-scoped conversation so the agent can retain context across findings.
             should_open_service_session = self.expert_foundry_enabled and self.max_llm_findings > 0 and any(
                 self._should_use_llm_for_finding(item) for item in prioritized_findings
             )
@@ -132,8 +167,14 @@ class ExpertSecurityAgent:
 
     @contextmanager
     def _open_service_review_session(self, service_payload: Dict[str, Any], span) -> Iterator[Dict[str, Any]]:
+        """Create one service-scoped conversation used across multiple finding turns.
+
+        The conversation is seeded with service context and deleted on exit to
+        avoid stale server-side state.
+        """
         conversation_id = ""
         with self._open_agent_service_clients() as (_, _, openai_client):
+            # Seed conversation with service context before per-finding prompts are appended.
             conversation = openai_client.conversations.create(
                 items=[
                     {
@@ -164,6 +205,7 @@ class ExpertSecurityAgent:
                     span.add_event("expert.service_session_delete_failed", {"error": str(cleanup_error)[:300]})
 
     def _build_service_review_session_prompt(self, service_payload: Dict[str, Any]) -> str:
+        """Build the initial conversation prompt that establishes shared service context."""
         sonar_findings = service_payload.get("sonar", {}).get("issues", [])
         sast_findings = service_payload.get("checkmarx", {}).get("sast", {}).get("findings", [])
         sca_findings = service_payload.get("checkmarx", {}).get("sca", {}).get("findings", [])
@@ -183,6 +225,7 @@ class ExpertSecurityAgent:
         )
 
     def _llm_analyze_finding(self, finding: Dict[str, Any], service_session: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Run one finding through Foundry with tracing, caching, and error wrapping."""
         compact_finding = self._compact_finding(finding)
         cache_key = self._cache_key(compact_finding)
         with self.tracer.start_as_current_span("expert_security_agent.llm_analyze_finding") as span:
@@ -228,6 +271,7 @@ class ExpertSecurityAgent:
         span,
         service_session: Dict[str, Any],
     ) -> Dict[str, Any]:
+        """Submit a prompt turn to the active Foundry conversation and normalize output."""
         openai_client = service_session["openai_client"]
         conversation_id = str(service_session["conversation_id"])
 
@@ -243,6 +287,7 @@ class ExpertSecurityAgent:
         span.set_attribute("llm.conversation_id", conversation_id)
         span.set_attribute("llm.prompt_preview", prompt[:400])
 
+        # Add each finding as a new turn on the same conversation to preserve agent memory.
         openai_client.conversations.items.create(
             conversation_id=conversation_id,
             items=[{"type": "message", "role": "user", "content": prompt}],
@@ -284,6 +329,11 @@ class ExpertSecurityAgent:
         return finding_result
 
     def _normalize_foundry_finding_result(self, parsed: Dict[str, Any], finding: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert variable model payloads into the stable analysis schema.
+
+        Handles both flat payloads and nested `analysis` lists, fills defaults for
+        missing fields, and mirrors aliases expected by workflow/reporting consumers.
+        """
         candidate = parsed
         if isinstance(parsed.get("analysis"), list) and parsed.get("analysis"):
             first = parsed["analysis"][0]
@@ -321,6 +371,7 @@ class ExpertSecurityAgent:
         }
 
     def _extract_agent_service_text(self, response_payload: Any) -> str:
+        """Extract text content from multiple possible Foundry response shapes."""
         output_text = self._extract_object_attr(response_payload, "output_text", None)
         if isinstance(output_text, str) and output_text.strip():
             return output_text
@@ -346,6 +397,12 @@ class ExpertSecurityAgent:
         return "{}"
 
     def _heuristic_analyze_finding(self, finding: Dict[str, Any]) -> Dict[str, Any]:
+        """Deterministically triage one finding when LLM analysis is not used.
+
+        Produces a report-ready structure with risk rationale, severity-aware
+        impact scoring, remediation guidance, and verification steps.
+        """
+        # Deterministic fallback path used when LLM triage is skipped or unavailable.
         finding_id = finding.get("id", "unknown")
         severity = str(finding.get("severity", "")).upper()
         category = finding.get("category") or finding.get("rule") or "Generic Security Finding"
@@ -359,11 +416,13 @@ class ExpertSecurityAgent:
         triage_category = "ADVISORY"
         impact_score = 3
 
+        # First handle malformed findings so they surface as warning-level governance input.
         if incomplete:
             risk = "INCOMPLETE_DATA"
             fix = "# INCOMPLETE_DATA: provide full finding metadata and execution context"
             triage_category = "WARNING"
             impact_score = 5
+        # High-confidence exploit classes get blocker treatment by default.
         elif "sql" in category.lower() or "injection" in category.lower() or "rce" in category.lower():
             risk = "Attacker-controlled input could execute unintended commands/queries, exposing data or host access."
             fix = (
@@ -372,6 +431,7 @@ class ExpertSecurityAgent:
             )
             triage_category = "BLOCKER"
             impact_score = 9
+        # Secret exposure is severe but not always immediately exploitable without additional context.
         elif "secret" in category.lower():
             risk = "Hardcoded credentials can be exfiltrated from source/history and reused across environments."
             fix = (
@@ -393,6 +453,7 @@ class ExpertSecurityAgent:
             triage_category = "ADVISORY"
             impact_score = 4
 
+        # Severity can escalate baseline categorization for final governance scoring.
         if severity == "CRITICAL" and not false_positive:
             risk = f"CRITICAL: {risk}"
             triage_category = "BLOCKER"
@@ -400,6 +461,7 @@ class ExpertSecurityAgent:
         elif severity == "HIGH" and not false_positive:
             impact_score = max(impact_score, 8)
 
+        # Provide report-ready remediation payload compatible with PDF deep-dive rendering.
         remediation_diff = f"diff --git a/{finding.get('file', 'src/file.py')} b/{finding.get('file', 'src/file.py')}\n--- a/{finding.get('file', 'src/file.py')}\n+++ b/{finding.get('file', 'src/file.py')}\n@@\n-# vulnerable pattern\n+{fix}"
 
         return {
@@ -425,6 +487,7 @@ class ExpertSecurityAgent:
         }
 
     def _parse_llm_json(self, raw_content: str) -> Dict[str, Any]:
+        """Parse model output into a JSON object, including fenced/embedded JSON cases."""
         cleaned = (raw_content or "").strip()
         if not cleaned:
             return {}
@@ -447,16 +510,19 @@ class ExpertSecurityAgent:
             return {}
 
     def _coerce_int(self, value: Any, default: int = 0) -> int:
+        """Best-effort integer coercion with default fallback."""
         try:
             return int(value)
         except (TypeError, ValueError):
             return default
 
     def _cache_key(self, compact_finding: Dict[str, Any]) -> str:
+        """Generate a stable SHA-256 key for one compact finding payload."""
         serialized = json.dumps(compact_finding, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
     def _load_cache(self) -> Dict[str, Dict[str, Any]]:
+        """Load cached LLM analyses from disk when caching is enabled."""
         if not self.cache_enabled:
             return {}
         if not self.cache_path.exists():
@@ -469,6 +535,7 @@ class ExpertSecurityAgent:
             return {}
 
     def _save_cache(self) -> None:
+        """Persist in-memory cache to disk; failures are logged but non-fatal."""
         if not self.cache_enabled:
             return
         try:
@@ -478,6 +545,7 @@ class ExpertSecurityAgent:
             print(f"[LLM][ExpertSecurityAgent] Cache write failed: {error}")
 
     def _severity_rank(self, severity: str) -> int:
+        """Map textual severities to sortable numeric priority."""
         rank = {
             "CRITICAL": 4,
             "HIGH": 3,
@@ -487,10 +555,12 @@ class ExpertSecurityAgent:
         return rank.get(str(severity).upper(), 0)
 
     def _should_use_llm_for_finding(self, finding: Dict[str, Any]) -> bool:
+        """Return True for findings that warrant higher-cost LLM triage."""
         severity = str(finding.get("severity", "")).upper()
         return severity in {"CRITICAL", "HIGH"} or bool(finding.get("cve"))
 
     def _compact_finding(self, finding: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a bounded-size finding payload suitable for prompts and cache keys."""
         return {
             "id": finding.get("id"),
             "severity": finding.get("severity"),
@@ -504,6 +574,7 @@ class ExpertSecurityAgent:
         }
 
     def _tool_source(self, finding: Dict[str, Any]) -> str:
+        """Infer scanner source label from finding fields."""
         if finding.get("cve") or finding.get("package"):
             return "Checkmarx"
         if finding.get("rule"):
@@ -511,6 +582,10 @@ class ExpertSecurityAgent:
         return "Checkmarx"
 
     def _detect_toxic_combinations(self, sonar_findings: List[Dict[str, Any]], sca_findings: List[Dict[str, Any]]):
+        """Emit synthetic blocker finding when risky multi-signal correlation is present.
+
+        Current rule: MEDIUM code weakness + CRITICAL dependency vulnerability.
+        """
         has_medium_code_bug = any(str(item.get("severity", "")).upper() == "MEDIUM" for item in sonar_findings)
         critical_dependency = next(
             (item for item in sca_findings if str(item.get("severity", "")).upper() == "CRITICAL"),
